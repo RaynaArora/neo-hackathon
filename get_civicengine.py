@@ -45,8 +45,8 @@ def query_civicengine(
     # Validate token
     if not api_token or api_token == "<INSERT TOKEN>":
         raise ValueError(
-            "API token not provided. Please set CIVIC_ENGINE_TOKEN in credentials.py "
-            "or pass the token parameter."
+            "API token not provided. Please set CIVIC_ENGINE_TOKEN in credentials.py, "
+            "set the CIVIC_ENGINE_TOKEN environment variable, or pass the token parameter."
         )
     
     # Prepare headers
