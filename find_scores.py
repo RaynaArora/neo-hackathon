@@ -1,9 +1,725 @@
+"""
+Election Donation Recommendation System
+
+This module calculates leverage scores for election races by combining:
+1. Competitiveness: How close the race is (from Kalshi markets or NANDA party data)
+2. Saturation: How much fundraising has already occurred (from FEC/OCPF/Kalshi)
+3. Impact: Federal vs State level weighting
+
+Data Sources:
+- Civic Engine API: Election and race information
+- Kalshi API: Prediction markets for competitiveness
+- FEC API: Federal campaign finance data
+- Kalshi proxy: Market volume/spread as proxy for state races
+- NANDA: County-level party affiliation data for competitiveness
+
+"""
+
 import requests
 import math
 import re
-from get_civicengine import get_current_state_federal_elections
-from credentials import FEC_TOKEN
-from typing import Optional, Dict, Any
+import csv
+import os
+from collections import defaultdict
+from get_civicengine import get_current_state_federal_elections, query_civicengine
+from credentials import FEC_TOKEN, CIVIC_ENGINE_TOKEN
+from typing import Optional, Dict, Any, List, Tuple
+from enum import Enum
+from datetime import datetime, timedelta
+
+
+# ============================================================================
+# ELECTION TYPE CLASSIFICATION
+# ============================================================================
+
+class ElectionType(Enum):
+    """Enumeration of election types for better classification."""
+    US_SENATE = "U.S. Senate"
+    US_HOUSE = "U.S. House of Representatives"
+    STATE_SENATE = "State Senate"
+    STATE_HOUSE = "State House of Representatives"
+    GOVERNOR = "Governor"
+    ATTORNEY_GENERAL = "Attorney General"
+    SECRETARY_OF_STATE = "Secretary of State"
+    JUDICIAL = "Judicial"
+    OTHER_STATE = "Other State Office"
+    UNKNOWN = "Unknown"
+
+
+def classify_election_type(race_name: str, race_level: str) -> ElectionType:
+    """
+    Classify the type of election from race name and level.
+    
+    Args:
+        race_name: Name of the race
+        race_level: Level of the race (FEDERAL, STATE, etc.)
+    
+    Returns:
+        ElectionType enum value
+    """
+    race_name_upper = race_name.upper()
+    
+    # Federal elections
+    if race_level == 'FEDERAL':
+        if 'U.S. SENATE' in race_name_upper or ('SENATE' in race_name_upper and 'U.S.' in race_name_upper):
+            return ElectionType.US_SENATE
+        elif 'U.S. HOUSE' in race_name_upper or ('HOUSE OF REPRESENTATIVES' in race_name_upper and 'U.S.' in race_name_upper):
+            return ElectionType.US_HOUSE
+    
+    # State elections
+    elif race_level == 'STATE':
+        # Check for state senate (STATE level + SENATE, but not U.S. Senate)
+        if ('STATE SENATE' in race_name_upper or 
+            ('SENATE' in race_name_upper and 'U.S.' not in race_name_upper)):
+            return ElectionType.STATE_SENATE
+        # Check for state house (STATE level + HOUSE, but not U.S. House)
+        elif ('STATE HOUSE' in race_name_upper or 
+              ('HOUSE OF REPRESENTATIVES' in race_name_upper and 'U.S.' not in race_name_upper) or
+              ('HOUSE' in race_name_upper and 'U.S.' not in race_name_upper)):
+            return ElectionType.STATE_HOUSE
+        elif 'GOVERNOR' in race_name_upper:
+            return ElectionType.GOVERNOR
+        elif 'ATTORNEY GENERAL' in race_name_upper:
+            return ElectionType.ATTORNEY_GENERAL
+        elif 'SECRETARY OF STATE' in race_name_upper:
+            return ElectionType.SECRETARY_OF_STATE
+        elif 'JUDGE' in race_name_upper or 'JUSTICE' in race_name_upper or 'COURT' in race_name_upper:
+            return ElectionType.JUDICIAL
+        else:
+            return ElectionType.OTHER_STATE
+    
+    return ElectionType.UNKNOWN
+
+
+def get_election_type_description(election_type: ElectionType) -> str:
+    """Get a human-readable description of the election type."""
+    return election_type.value
+
+
+# ============================================================================
+# NANDA DATA LOADING AND PROCESSING
+# ============================================================================
+
+def load_nanda_data(tsv_path: str = "nanda.tsv", year: Optional[int] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Load NANDA dataset and organize by FIPS code.
+    
+    Args:
+        tsv_path: Path to the NANDA TSV file
+        year: Optional year to filter data (uses most recent if not specified)
+    
+    Returns:
+        Dictionary mapping FIPS codes to list of records for that FIPS
+    """
+    if not os.path.exists(tsv_path):
+        return {}
+    
+    nanda_data = defaultdict(list)
+    max_year = 0
+    
+    try:
+        with open(tsv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                fips = row.get('STCOFIPS10', '').strip()
+                year_str = row.get('YEAR', '').strip()
+                
+                if not fips or not year_str:
+                    continue
+                
+                try:
+                    record_year = int(year_str)
+                    max_year = max(max_year, record_year)
+                    
+                    # Filter by year if specified
+                    if year and record_year != year:
+                        continue
+                    
+                    nanda_data[fips].append({
+                        'year': record_year,
+                        'fips': fips,
+                        'pres_dem_ratio': _parse_ratio(row.get('PRES_DEM_RATIO', '')),
+                        'pres_rep_ratio': _parse_ratio(row.get('PRES_REP_RATIO', '')),
+                        'sen_dem_ratio': _parse_ratio(row.get('SEN_DEM_RATIO', '')),
+                        'sen_rep_ratio': _parse_ratio(row.get('SEN_REP_RATIO', '')),
+                        'partisan_index_dem': _parse_ratio(row.get('PARTISAN_INDEX_DEM', '')),
+                        'partisan_index_rep': _parse_ratio(row.get('PARTISAN_INDEX_REP', '')),
+                    })
+                except (ValueError, TypeError):
+                    continue
+        
+        # If no year specified, use most recent year's data
+        if not year and max_year > 0:
+            filtered_data = {}
+            for fips, records in nanda_data.items():
+                latest_record = max(records, key=lambda x: x['year'])
+                if latest_record['year'] == max_year:
+                    filtered_data[fips] = [latest_record]
+            return filtered_data
+        
+        return dict(nanda_data)
+        
+    except Exception as e:
+        print(f"Error loading NANDA data: {e}")
+        return {}
+
+
+def _parse_ratio(value: str) -> Optional[float]:
+    """Parse a ratio value from NANDA data."""
+    if not value or value.strip() == '':
+        return None
+    try:
+        return float(value.strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def extract_fips_from_race(race_name: str, state_abbrev: Optional[str] = None) -> List[str]:
+    """
+    Extract potential FIPS codes for a race.
+    
+    For House districts, this is complex as districts span multiple counties.
+    For now, we'll return state-level FIPS (state code + 000 for all counties in state).
+    For Senate races, we can use state-level data.
+    
+    Args:
+        race_name: Name of the race
+        state_abbrev: State abbreviation (2-letter code)
+    
+    Returns:
+        List of FIPS codes (can be multiple for House districts)
+    """
+    if not state_abbrev:
+        state_abbrev = extract_state_from_race_name(race_name)
+    
+    if not state_abbrev:
+        return []
+    
+    # State FIPS codes (first 2 digits)
+    state_fips_map = {
+        'AL': '01', 'AK': '02', 'AZ': '04', 'AR': '05', 'CA': '06', 'CO': '08', 'CT': '09',
+        'DE': '10', 'FL': '12', 'GA': '13', 'HI': '15', 'ID': '16', 'IL': '17', 'IN': '18',
+        'IA': '19', 'KS': '20', 'KY': '21', 'LA': '22', 'ME': '23', 'MD': '24', 'MA': '25',
+        'MI': '26', 'MN': '27', 'MS': '28', 'MO': '29', 'MT': '30', 'NE': '31', 'NV': '32',
+        'NH': '33', 'NJ': '34', 'NM': '35', 'NY': '36', 'NC': '37', 'ND': '38', 'OH': '39',
+        'OK': '40', 'OR': '41', 'PA': '42', 'RI': '44', 'SC': '45', 'SD': '46', 'TN': '47',
+        'TX': '48', 'UT': '49', 'VT': '50', 'VA': '51', 'WA': '53', 'WV': '54', 'WI': '55',
+        'WY': '56', 'DC': '11'
+    }
+    
+    state_fips = state_fips_map.get(state_abbrev)
+    if not state_fips:
+        return []
+    
+    # For now, return empty list - we'll need to aggregate by state
+    # In a full implementation, we'd map districts to counties
+    return [state_fips]
+
+
+def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType, 
+                                    nanda_data: Dict[str, List[Dict[str, Any]]],
+                                    year: Optional[int] = None,
+                                    verbose: bool = False) -> float:
+    """
+    Calculate competitiveness score using NANDA party split data.
+    
+    Args:
+        race_name: Name of the race
+        race_type: Type of election
+        nanda_data: NANDA data organized by FIPS code
+        year: Election year (uses most recent data if not specified)
+        verbose: Whether to print debug information
+    
+    Returns:
+        Competitiveness score between 0 and 1 (higher = more competitive)
+    """
+    state_abbrev = extract_state_from_race_name(race_name)
+    if not state_abbrev:
+        if verbose:
+            print(f"  NANDA: Could not extract state from race name: {race_name}")
+        return 0.5  # Default moderate competitiveness
+    
+    # Get state FIPS code
+    state_fips_map = {
+        'AL': '01', 'AK': '02', 'AZ': '04', 'AR': '05', 'CA': '06', 'CO': '08', 'CT': '09',
+        'DE': '10', 'FL': '12', 'GA': '13', 'HI': '15', 'ID': '16', 'IL': '17', 'IN': '18',
+        'IA': '19', 'KS': '20', 'KY': '21', 'LA': '22', 'ME': '23', 'MD': '24', 'MA': '25',
+        'MI': '26', 'MN': '27', 'MS': '28', 'MO': '29', 'MT': '30', 'NE': '31', 'NV': '32',
+        'NH': '33', 'NJ': '34', 'NM': '35', 'NY': '36', 'NC': '37', 'ND': '38', 'OH': '39',
+        'OK': '40', 'OR': '41', 'PA': '42', 'RI': '44', 'SC': '45', 'SD': '46', 'TN': '47',
+        'TX': '48', 'UT': '49', 'VT': '50', 'VA': '51', 'WA': '53', 'WV': '54', 'WI': '55',
+        'WY': '56', 'DC': '11'
+    }
+    
+    state_fips_prefix = state_fips_map.get(state_abbrev)
+    if not state_fips_prefix:
+        if verbose:
+            print(f"  NANDA: Could not find FIPS code for state: {state_abbrev}")
+        return 0.5
+    
+    # Aggregate data for all counties in the state
+    state_ratios = []
+    
+    # Determine which ratio field to use based on race type
+    ratio_field = None
+    if race_type == ElectionType.US_SENATE or race_type == ElectionType.STATE_SENATE:
+        ratio_field = 'sen_dem_ratio'
+    elif race_type == ElectionType.US_HOUSE or race_type == ElectionType.STATE_HOUSE:
+        ratio_field = 'pres_dem_ratio'  # Use presidential as proxy for House
+    else:
+        ratio_field = 'pres_dem_ratio'  # Default to presidential
+    
+    # Collect ratios from all counties in the state
+    for fips, records in nanda_data.items():
+        if fips.startswith(state_fips_prefix):
+            for record in records:
+                if year is None or record['year'] == year:
+                    ratio = record.get(ratio_field)
+                    if ratio is not None:
+                        state_ratios.append(ratio)
+    
+    if not state_ratios:
+        if verbose:
+            print(f"  NANDA: No data found for {state_abbrev} ({state_fips_prefix}*)")
+        return 0.5  # Default moderate competitiveness
+    
+    # Calculate average party split for the state
+    avg_dem_ratio = sum(state_ratios) / len(state_ratios)
+    avg_rep_ratio = 1.0 - avg_dem_ratio
+    
+    # Competitiveness: closer to 50/50 = more competitive
+    # Formula: 1 - abs(0.5 - dem_ratio) / 0.5
+    # This gives: 50/50 = 1.0, 60/40 = 0.8, 70/30 = 0.6, etc.
+    competitiveness = 1.0 - abs(0.5 - avg_dem_ratio) / 0.5
+    competitiveness = max(0.0, min(1.0, competitiveness))
+    
+    if verbose:
+        print(f"  NANDA: State {state_abbrev}: Dem {avg_dem_ratio:.1%}, Rep {avg_rep_ratio:.1%}")
+        print(f"  NANDA: Competitiveness score: {competitiveness:.3f} (based on {len(state_ratios)} counties)")
+    
+    return competitiveness
+
+
+# ============================================================================
+# HISTORICAL ELECTION DATA FROM CIVIC ENGINE
+# ============================================================================
+
+def get_historical_election_results(race_name: str, position_id: Optional[str] = None, 
+                                     years_back: int = 4, verbose: bool = False) -> List[Dict[str, Any]]:
+    """
+    Get historical election results for a specific race from Civic Engine API.
+    
+    This function uses a hybrid approach:
+    1. Gets past election candidates from GraphQL API
+    2. Determines winner by matching to current office holder (for most recent election)
+    3. Maps winners to parties using FEC API
+    
+    Args:
+        race_name: Name of the race (e.g., "U.S. House of Representatives - North Carolina 2nd Congressional District")
+        position_id: Optional position ID from Civic Engine (not currently used)
+        years_back: How many years back to look for historical elections (default: 4)
+        verbose: Whether to print debug information
+    
+    Returns:
+        List of historical election results with winner and party information
+    """
+    # Parse race to get office, state, district
+    race_info = parse_race_name(race_name)
+    if not race_info['office'] or not race_info['state']:
+        if verbose:
+            print(f"  Historical: Could not parse race name: {race_name}")
+        return []
+    
+    # Historical data should work for all race types that have positions in Civic Engine
+    # No need to restrict to specific office types - let the function try to find the position
+    
+    # Import the Civic Engine-based historical winners function
+    try:
+        from get_historical_winners_civicengine import get_historical_winners_civicengine
+        
+        if verbose:
+            print(f"  Historical: Fetching historical winners from Civic Engine API...")
+        
+        # Get historical winners using Civic Engine API (direct ElectionResult field)
+        winners = get_historical_winners_civicengine(race_name, years_back=years_back, verbose=verbose)
+        
+        if not winners:
+            if verbose:
+                print(f"  Historical: No winners found from Civic Engine, falling back to NANDA data")
+            return []
+        
+        # Convert to expected format
+        results = []
+        for winner in winners:
+            results.append({
+                'year': winner['year'],
+                'winner_name': winner['name'],
+                'winner_party': winner['party'],
+                'method': winner.get('method', 'civicengine_result')
+            })
+        
+        if verbose:
+            print(f"  Historical: Found {len(results)} historical winner(s) from Civic Engine")
+            for result in results:
+                print(f"    - {result['year']}: {result['winner_name']} ({result['winner_party'] or 'Unknown party'})")
+        
+        return results
+        
+    except Exception as e:
+        if verbose:
+            print(f"  Historical: Error fetching historical winners from Civic Engine: {e}")
+            print(f"  Historical: Falling back to NANDA data")
+        import traceback
+        if verbose:
+            traceback.print_exc()
+        return []
+
+
+def get_candidate_party_from_fec(candidate_name: str, bioguide_id: Optional[str] = None,
+                                  state: Optional[str] = None, district: Optional[int] = None,
+                                  cycle: int = 2024, verbose: bool = False) -> Optional[str]:
+    """
+    Get a candidate's party affiliation from FEC API.
+    
+    Args:
+        candidate_name: Candidate's full name
+        bioguide_id: Optional Bioguide ID (not directly used by FEC API, but kept for reference)
+        state: State abbreviation
+        district: District number (for House races)
+        cycle: Election cycle year
+        verbose: Whether to print debug information
+    
+    Returns:
+        Party abbreviation (e.g., "DEM", "REP", "IND") or None if not found
+    """
+    # FEC API search endpoint works better for name-based queries
+    search_url = "https://api.open.fec.gov/v1/candidates/search/"
+    
+    params = {
+        'api_key': FEC_TOKEN,
+        'per_page': 10,
+        'cycle': cycle
+    }
+    
+    # Extract last name from full name (more reliable for FEC search)
+    name_parts = candidate_name.split()
+    if name_parts:
+        last_name = name_parts[-1].upper()
+        params['q'] = last_name
+    
+    # Add state filter if available
+    if state:
+        params['state'] = state
+    
+    try:
+        response = requests.get(search_url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        candidates = data.get('results', [])
+        if not candidates:
+            # Try previous cycle
+            if cycle > 2020:
+                return get_candidate_party_from_fec(candidate_name, bioguide_id, state, district, 
+                                                     cycle - 2, verbose)
+            if verbose:
+                print(f"  FEC Party Lookup: No candidates found for {candidate_name}")
+            return None
+        
+        # Try to find best match by name and district
+        best_match = None
+        for candidate in candidates:
+            cand_name = candidate.get('name', '').upper()
+            cand_state = candidate.get('state', '')
+            cand_district = candidate.get('district', '')
+            
+            # Check if name matches (last name should match)
+            if last_name in cand_name:
+                # For House races, check district match
+                if district is not None:
+                    if cand_district == str(district).zfill(2) and cand_state == state:
+                        best_match = candidate
+                        break
+                elif state and cand_state == state:
+                    # For Senate or other races, just match state
+                    best_match = candidate
+                    break
+        
+        # If no exact match, use first result
+        if not best_match:
+            best_match = candidates[0]
+            if verbose:
+                print(f"  FEC Party Lookup: Using first result for {candidate_name} (may not be exact match)")
+        
+        # Get party from candidate
+        party = best_match.get('party_full', '') or best_match.get('party', '')
+        
+        if party:
+            # Normalize party name
+            party_upper = party.upper()
+            if 'DEMOCRAT' in party_upper:
+                return 'DEM'
+            elif 'REPUBLICAN' in party_upper:
+                return 'REP'
+            elif 'INDEPENDENT' in party_upper or party_upper == 'IND':
+                return 'IND'
+            elif 'GREEN' in party_upper:
+                return 'GRN'
+            elif 'LIBERTARIAN' in party_upper:
+                return 'LIB'
+            else:
+                # Return first 3 chars as abbreviation, or full if short
+                return party[:3] if len(party) > 3 else party
+        
+        return None
+        
+    except Exception as e:
+        if verbose:
+            print(f"  FEC Party Lookup: Error for {candidate_name}: {e}")
+        return None
+
+
+def get_current_officeholder_winner(race_name: str, verbose: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Get the current office holder for a House race, who represents the most recent winner.
+    
+    This is a practical approach given API limitations - we identify who currently holds
+    the office, which indicates they won the most recent election.
+    
+    Args:
+        race_name: Name of the race
+        verbose: Whether to print debug info
+    
+    Returns:
+        Dictionary with winner info (name, party, bioguide_id) or None
+    """
+    race_info = parse_race_name(race_name)
+    if not race_info['office'] or not race_info['state'] or not race_info.get('district'):
+        return None
+    
+    state = race_info['state']
+    district = race_info['district']
+    
+    # Query OfficeHolders
+    query = '''
+    query GetOfficeHolders($first: Int!) {
+      officeHolders(first: $first) {
+        nodes {
+          id
+          person {
+            id
+            fullName
+            bioguideId
+          }
+          position {
+            id
+            name
+            level
+          }
+        }
+      }
+    }
+    '''
+    
+    try:
+        result = query_civicengine(query, {'first': 500}, CIVIC_ENGINE_TOKEN)
+        if 'errors' in result:
+            return None
+        
+        office_holders = result.get('data', {}).get('officeHolders', {}).get('nodes', [])
+        
+        # State name mapping
+        state_names = {
+            'AL': 'Alabama', 'AK': 'Alaska', 'AZ': 'Arizona', 'AR': 'Arkansas',
+            'CA': 'California', 'CO': 'Colorado', 'CT': 'Connecticut', 'DE': 'Delaware',
+            'FL': 'Florida', 'GA': 'Georgia', 'HI': 'Hawaii', 'ID': 'Idaho',
+            'IL': 'Illinois', 'IN': 'Indiana', 'IA': 'Iowa', 'KS': 'Kansas',
+            'KY': 'Kentucky', 'LA': 'Louisiana', 'ME': 'Maine', 'MD': 'Maryland',
+            'MA': 'Massachusetts', 'MI': 'Michigan', 'MN': 'Minnesota', 'MS': 'Mississippi',
+            'MO': 'Missouri', 'MT': 'Montana', 'NE': 'Nebraska', 'NV': 'Nevada',
+            'NH': 'New Hampshire', 'NJ': 'New Jersey', 'NM': 'New Mexico', 'NY': 'New York',
+            'NC': 'North Carolina', 'ND': 'North Dakota', 'OH': 'Ohio', 'OK': 'Oklahoma',
+            'OR': 'Oregon', 'PA': 'Pennsylvania', 'RI': 'Rhode Island', 'SC': 'South Carolina',
+            'SD': 'South Dakota', 'TN': 'Tennessee', 'TX': 'Texas', 'UT': 'Utah',
+            'VT': 'Vermont', 'VA': 'Virginia', 'WA': 'Washington', 'WV': 'West Virginia',
+            'WI': 'Wisconsin', 'WY': 'Wyoming', 'DC': 'District of Columbia'
+        }
+        state_name = state_names.get(state, '')
+        
+        # Find matching office holder
+        for oh in office_holders:
+            position = oh.get('position', {})
+            pos_name = position.get('name', '')
+            pos_level = position.get('level', '')
+            
+            if pos_level != 'FEDERAL' or 'House of Representatives' not in pos_name:
+                continue
+            
+            # Check state match
+            if state not in pos_name and state_name not in pos_name:
+                continue
+            
+            # Check district match
+            district_str = str(district)
+            ordinal_suffixes = {1: 'st', 2: 'nd', 3: 'rd', 11: 'th', 12: 'th', 13: 'th'}
+            suffix = ordinal_suffixes.get(district % 100, 'th')
+            if district % 100 not in [11, 12, 13]:
+                suffix = ordinal_suffixes.get(district % 10, 'th')
+            
+            district_patterns = [
+                f" {district}{suffix} Congressional",
+                f"District {district}",
+                f" {district} ",
+            ]
+            
+            if any(pattern in pos_name for pattern in district_patterns):
+                person = oh.get('person', {})
+                name = person.get('fullName', '')
+                bioguide_id = person.get('bioguideId')
+                
+                # Get party from FEC
+                party = get_candidate_party_from_fec(
+                    name, bioguide_id, state, district,
+                    cycle=2024, verbose=False
+                )
+                
+                return {
+                    'name': name,
+                    'bioguide_id': bioguide_id,
+                    'party': party,
+                }
+        
+        return None
+    except Exception:
+        return None
+
+
+def calculate_competitiveness_from_historical(race_name: str, race_type: ElectionType,
+                                               verbose: bool = False) -> Tuple[float, Dict[str, Any]]:
+    """
+    Calculate competitiveness score from historical election results.
+    
+    APPROACH: Uses current office holder (most recent winner) to determine party.
+    Since comprehensive historical election data with vote counts is not available
+    from Civic Engine or FEC APIs, we use a practical approach:
+    - Get current office holder (represents most recent winner)
+    - Map to party using FEC API
+    - For competitiveness, this gives us one data point (current party in power)
+    
+    LIMITATIONS:
+    - Only provides most recent winner, not historical trends
+    - OfficeHolder data may be incomplete in Civic Engine
+    - No vote margins or multiple election cycles available
+    
+    Future improvements: Could integrate external data sources like:
+    - MIT Election Data and Science Lab
+    - AP Election Data
+    - Manual database of historical results
+    
+    Args:
+        race_name: Name of the race
+        race_type: Type of election
+        verbose: Whether to print debug information
+    
+    Returns:
+        Tuple of (competitiveness_score, metadata_dict)
+        competitiveness_score: 0-1 score (higher = more competitive)
+        metadata_dict: Contains data quality info, historical results, etc.
+    """
+    metadata = {
+        "data_quality": "low",
+        "historical_elections_found": 0,
+        "method": "fec_historical",
+        "warnings": [],
+        "historical_winners": []
+    }
+    
+    # Historical data should work for all race types
+    # Try to get historical data regardless of race type
+    
+    # Get historical election results from FEC
+    historical_results = get_historical_election_results(race_name, years_back=6, verbose=verbose)
+    
+    if not historical_results:
+        if verbose:
+            print(f"  Historical: No historical results found, falling back to NANDA")
+        metadata["warnings"].append("No historical election results available")
+        metadata["data_quality"] = "none"
+        return 0.5, metadata  # Default moderate competitiveness
+    
+    metadata["historical_elections_found"] = len(historical_results)
+    metadata["historical_winners"] = historical_results
+    
+    # Calculate competitiveness based on party consistency
+    parties = [r.get('winner_party') for r in historical_results if r.get('winner_party')]
+    
+    if not parties:
+        metadata["warnings"].append("No party information in historical results")
+        metadata["data_quality"] = "low"
+        return 0.5, metadata
+    
+    # Count unique parties
+    unique_parties = set(parties)
+    num_elections = len(parties)
+    
+    if num_elections == 0:
+        metadata["data_quality"] = "low"
+        return 0.5, metadata
+    
+    # Competitiveness calculation:
+    # - If only one party wins all elections: low competitiveness (0.2-0.4)
+    # - If two parties alternate or split: high competitiveness (0.6-0.9)
+    # - More elections = more confidence in the score
+    
+    if len(unique_parties) == 1:
+        # Same party wins all elections - safe seat
+        competitiveness = 0.3  # Low competitiveness
+        if verbose:
+            print(f"  Historical: Same party ({parties[0]}) won all {num_elections} election(s) - safe seat")
+    elif len(unique_parties) == 2:
+        # Two parties - check if they alternate
+        # Count transitions (party changes)
+        transitions = sum(1 for i in range(1, len(parties)) if parties[i] != parties[i-1])
+        transition_ratio = transitions / (len(parties) - 1) if len(parties) > 1 else 0
+        
+        if transition_ratio > 0.5:
+            # Parties alternate frequently - very competitive
+            competitiveness = 0.8
+            if verbose:
+                print(f"  Historical: Party swings detected ({transitions} transitions in {num_elections} elections) - competitive")
+        else:
+            # Some variation but mostly one party
+            competitiveness = 0.5
+            if verbose:
+                print(f"  Historical: Some party variation ({len(unique_parties)} parties) - moderate competitiveness")
+    else:
+        # Multiple parties - very competitive
+        competitiveness = 0.9
+        if verbose:
+            print(f"  Historical: Multiple parties ({len(unique_parties)}) - highly competitive")
+    
+    # Adjust data quality based on number of elections
+    if num_elections >= 3:
+        metadata["data_quality"] = "high"
+    elif num_elections >= 2:
+        metadata["data_quality"] = "medium"
+    else:
+        metadata["data_quality"] = "low"
+        metadata["warnings"].append("Limited historical data - only one election cycle")
+    
+    metadata["num_elections"] = num_elections
+    metadata["unique_parties"] = list(unique_parties)
+    metadata["competitiveness"] = competitiveness
+    
+    if verbose:
+        print(f"  Historical: Competitiveness score: {competitiveness:.3f} (based on {num_elections} election(s))")
+    
+    return competitiveness, metadata
+
+
+# ============================================================================
+# KALSHI API INTEGRATION
+# ============================================================================
 
 def clean_search_query(race_name):
     """Cleans a CivicEngine race name into a good Kalshi search query."""
@@ -19,10 +735,165 @@ def clean_search_query(race_name):
         return race_name.replace("House of Representatives - ", "").replace("HD", "")
     return race_name
 
-def get_kalshi_market(race_name):
+def validate_kalshi_market_match(market_series: Dict[str, Any], race_name: str, 
+                                  election_year: Optional[int] = None, 
+                                  verbose: bool = False) -> Tuple[bool, float, List[str]]:
     """
-    Searches the Kalshi API for a given race.
-    Returns the *first matching series* or None.
+    Validate that a Kalshi market series matches the race we're looking for.
+    
+    Args:
+        market_series: Market series from Kalshi API
+        race_name: Race name we're looking for
+        election_year: Expected election year (optional)
+        verbose: Whether to print debug info
+    
+    Returns:
+        Tuple of (is_valid, match_score, warnings)
+        - is_valid: True if market is a good match
+        - match_score: 0-1 score indicating match quality
+        - warnings: List of warnings about the match
+    """
+    warnings = []
+    match_score = 0.0
+    
+    if not market_series:
+        return False, 0.0, ["No market series provided"]
+    
+    # Extract market info (Kalshi uses different field names)
+    # Keep ticker in original case for matching (it's usually uppercase like "HOUSETN7S")
+    market_title = (market_series.get('series_title', '') or market_series.get('event_title', '') or '').lower()
+    market_subtitle = (market_series.get('event_subtitle', '') or '').lower()
+    market_ticker_orig = market_series.get('series_ticker', '') or market_series.get('event_ticker', '') or ''
+    market_ticker = market_ticker_orig.lower()  # For case-insensitive matching
+    market_ticker_upper = market_ticker_orig.upper()  # For uppercase matching (e.g., "HOUSETN7S")
+    
+    # Parse race info
+    race_info = parse_race_name(race_name)
+    race_lower = race_name.lower()
+    
+    # Check state match
+    state_match = False
+    if race_info.get('state'):
+        state = race_info['state'].lower()
+        state_names = {
+            'al': 'alabama', 'ak': 'alaska', 'az': 'arizona', 'ar': 'arkansas',
+            'ca': 'california', 'co': 'colorado', 'ct': 'connecticut', 'de': 'delaware',
+            'fl': 'florida', 'ga': 'georgia', 'hi': 'hawaii', 'id': 'idaho',
+            'il': 'illinois', 'in': 'indiana', 'ia': 'iowa', 'ks': 'kansas',
+            'ky': 'kentucky', 'la': 'louisiana', 'me': 'maine', 'md': 'maryland',
+            'ma': 'massachusetts', 'mi': 'michigan', 'mn': 'minnesota', 'ms': 'mississippi',
+            'mo': 'missouri', 'mt': 'montana', 'ne': 'nebraska', 'nv': 'nevada',
+            'nh': 'new hampshire', 'nj': 'new jersey', 'nm': 'new mexico', 'ny': 'new york',
+            'nc': 'north carolina', 'nd': 'north dakota', 'oh': 'ohio', 'ok': 'oklahoma',
+            'or': 'oregon', 'pa': 'pennsylvania', 'ri': 'rhode island', 'sc': 'south carolina',
+            'sd': 'south dakota', 'tn': 'tennessee', 'tx': 'texas', 'ut': 'utah',
+            'vt': 'vermont', 'va': 'virginia', 'wa': 'washington', 'wv': 'west virginia',
+            'wi': 'wisconsin', 'wy': 'wyoming', 'dc': 'district of columbia'
+        }
+        state_full = state_names.get(state, state)
+        
+        # Check state match - look for state abbreviation or full name
+        state_lower = state.lower()
+        state_full_lower = state_full.lower()
+        state_upper = state.upper()
+        if (state_lower in market_title or state_lower in market_ticker or 
+            state_full_lower in market_title or state_upper in market_ticker_upper):
+            state_match = True
+            match_score += 0.3
+        else:
+            warnings.append(f"State mismatch: looking for {race_info['state']}, market may be for different state")
+    
+    # Check office type match
+    office_match = False
+    if race_info.get('office') == 'H':
+        # Look for HOUSE in ticker (e.g., HOUSETN7S) or 'house' in title
+        if ('house' in market_title or 'HOUSE' in market_ticker_upper or 
+            market_ticker_upper.startswith('HOUSE') or 'h-' in market_ticker):
+            office_match = True
+            match_score += 0.3
+        else:
+            warnings.append("Office type mismatch: looking for House, market may be for different office")
+    elif race_info.get('office') == 'S':
+        # Look for SENATE in ticker or 'senate' in title
+        if ('senate' in market_title or 'SENATE' in market_ticker_upper or 
+            market_ticker_upper.startswith('SENATE') or 's-' in market_ticker):
+            office_match = True
+            match_score += 0.3
+        else:
+            warnings.append("Office type mismatch: looking for Senate, market may be for different office")
+    
+    # Check district match (for House races)
+    district_match = False
+    if race_info.get('office') == 'H' and race_info.get('district'):
+        district = race_info['district']
+        # Check if district number appears in market (e.g., HOUSETN7S or TN 7)
+        district_str = str(district)
+        # Look for district in ticker (e.g., HOUSETN7S has 7) or title (e.g., "TN 7")
+        if (district_str in market_title or district_str in market_ticker or 
+            f"-{district:02d}" in market_ticker or f"{district:02d}" in market_ticker):
+            district_match = True
+            match_score += 0.2
+        else:
+            warnings.append(f"District mismatch: looking for district {district}, market may be for different district")
+    
+    # Check year match
+    year_match = False
+    if election_year:
+        year_str = str(election_year)
+        if year_str in market_title or year_str in market_ticker:
+            year_match = True
+            match_score += 0.2
+        else:
+            # Check if it's close (within 2 years)
+            year_matches = re.findall(r'\b(20\d{2})\b', market_title + ' ' + market_ticker)
+            if year_matches:
+                market_year = int(year_matches[0])
+                year_diff = abs(market_year - election_year)
+                if year_diff <= 2:
+                    year_match = True
+                    match_score += 0.1
+                    warnings.append(f"Year mismatch: looking for {election_year}, market is for {market_year} (using anyway)")
+                else:
+                    warnings.append(f"Year mismatch: looking for {election_year}, market is for {market_year}")
+            else:
+                warnings.append(f"Year not found in market: looking for {election_year}")
+    
+    # Determine if match is valid
+    # Need at least state and office match, and district match for House
+    is_valid = state_match and office_match
+    if race_info.get('office') == 'H' and race_info.get('district'):
+        is_valid = is_valid and district_match
+    
+    # Lower threshold for validity if year is close
+    if not is_valid and state_match and office_match:
+        if year_match or not election_year:  # If year matches or not specified, be more lenient
+            is_valid = True
+            warnings.append("Using market despite some mismatches (state and office match)")
+    
+    if verbose:
+        if is_valid:
+            print(f"  ✓ Market validation: GOOD MATCH (score: {match_score:.2f})")
+        else:
+            print(f"  ✗ Market validation: POOR MATCH (score: {match_score:.2f})")
+        if warnings:
+            for warning in warnings:
+                print(f"    ⚠️  {warning}")
+    
+    return is_valid, match_score, warnings
+
+
+def get_kalshi_market(race_name, election_year: Optional[int] = None, verbose: bool = False):
+    """
+    Searches the Kalshi API for a given race and validates the match.
+    Returns the best matching series or None.
+    
+    Args:
+        race_name: Race name to search for
+        election_year: Expected election year (optional, for validation)
+        verbose: Whether to print validation info
+    
+    Returns:
+        Best matching market series or None, along with validation info
     """
     query = clean_search_query(race_name)
     url = "https://api.elections.kalshi.com/v1/search/series"
@@ -37,29 +908,90 @@ def get_kalshi_market(race_name):
         response.raise_for_status()
         data = response.json()
         
+        # Get all search results
+        all_series = []
+        
         # Handle different possible response structures
         if 'current_page' in data and data['current_page']:
-            # Return the *first and most relevant* search result
-            series = data['current_page'][0]
-            # Ensure markets exist in the response
-            if 'markets' in series:
-                return series
+            all_series = data['current_page']
         elif 'series' in data and data['series']:
-            # Alternative response structure
-            series = data['series'][0]
-            if 'markets' in series:
-                return series
-        elif isinstance(data, list) and len(data) > 0:
-            # Direct list response
-            series = data[0]
-            if 'markets' in series:
-                return series
+            all_series = data['series']
+        elif isinstance(data, list):
+            all_series = data
+        
+        if not all_series:
+            if verbose:
+                print(f"  Kalshi: No markets found for '{race_name}'")
+            return None
+        
+        if verbose:
+            print(f"  Kalshi: Found {len(all_series)} market series")
+        
+        # Validate and score each series (without verbose output for each)
+        scored_series = []
+        for series in all_series:
+            if 'markets' not in series or not series.get('markets'):
+                continue
+            
+            # Validate without verbose output (we'll only show final result)
+            is_valid, match_score, warnings = validate_kalshi_market_match(
+                series, race_name, election_year, verbose=False
+            )
+            
+            scored_series.append({
+                'series': series,
+                'is_valid': is_valid,
+                'match_score': match_score,
+                'warnings': warnings
+            })
+        
+        if not scored_series:
+            if verbose:
+                print(f"  Kalshi: No valid markets found (all lacked market data)")
+            return None
+        
+        # Sort by match score (highest first), prioritize valid matches
+        scored_series.sort(key=lambda x: (x['is_valid'], x['match_score']), reverse=True)
+        
+        # Get best match
+        best_match = scored_series[0]
+        
+        # Only print validation result (good match or not)
+        if verbose:
+            market_title_display = (best_match['series'].get('series_title') or 
+                                   best_match['series'].get('event_title') or 
+                                   best_match['series'].get('series_ticker', 'Unknown'))
+            if best_match['is_valid']:
+                print(f"  ✓ Kalshi: Found good match - {market_title_display} (score: {best_match['match_score']:.2f})")
+            else:
+                print(f"  ⚠️  Kalshi: Poor match found - {market_title_display} (score: {best_match['match_score']:.2f})")
+                # Only show warnings if it's a poor match
+                if best_match['warnings']:
+                    for warning in best_match['warnings'][:3]:  # Limit to first 3 warnings
+                        print(f"    - {warning}")
+                    if len(best_match['warnings']) > 3:
+                        print(f"    ... and {len(best_match['warnings']) - 3} more warnings")
+        
+        # Return best match if it's valid or if it's the best we have
+        # Include validation info in the series for later use
+        best_series = best_match['series']
+        best_series['_validation'] = {
+            'is_valid': best_match['is_valid'],
+            'match_score': best_match['match_score'],
+            'warnings': best_match['warnings']
+        }
+        
+        return best_series
+        
     except requests.RequestException as e:
-        print(f"Kalshi API error for '{race_name}': {e}")
+        if verbose:
+            print(f"  Kalshi API error for '{race_name}': {e}")
     except (KeyError, IndexError, TypeError) as e:
-        print(f"Kalshi API response parsing error for '{race_name}': {e}")
+        if verbose:
+            print(f"  Kalshi API response parsing error for '{race_name}': {e}")
     except Exception as e:
-        print(f"Unexpected error querying Kalshi for '{race_name}': {e}")
+        if verbose:
+            print(f"  Unexpected error querying Kalshi for '{race_name}': {e}")
 
     return None
 
@@ -97,6 +1029,10 @@ def calculate_competitiveness_primary(markets):
     leader_score = max(0, (1 - (p1 / 100)))
     gap_score = max(0, (1 - ((p1 - p2) / 100)))
     return leader_score * gap_score
+
+# ============================================================================
+# FEC API INTEGRATION
+# ============================================================================
 
 def parse_race_name(race_name):
     """
@@ -151,6 +1087,9 @@ def parse_race_name(race_name):
             district_match = re.search(r'District\s+(\d+)', race_name)
             if district_match:
                 result['district'] = int(district_match.group(1))
+            # Check for At Large districts
+            elif 'At Large' in race_name or 'at-large' in race_name.lower():
+                result['district'] = None  # At Large district
     
     return result
 
@@ -322,8 +1261,37 @@ def calculate_saturation_fec(race_name: str, cycle: int = 2024, verbose: bool = 
     
     return saturation_score
 
-def calculate_saturation_kalshi(volume, spread):
-    """Uses Kalshi's own metrics as a proxy for saturation/attention."""
+# ============================================================================
+# Note: OCPF (Massachusetts campaign finance) data has been removed.
+# All state races now use Kalshi proxy for saturation scoring.
+
+
+# ============================================================================
+# SATURATION CALCULATION HELPERS
+# ============================================================================
+
+def calculate_saturation_kalshi(volume, spread, verbose: bool = False) -> Tuple[float, Dict[str, Any]]:
+    """
+    Uses Kalshi's own metrics as a proxy for saturation/attention.
+    
+    Args:
+        volume: Market volume
+        spread: Bid-ask spread
+        verbose: Whether to print debug information
+    
+    Returns:
+        Tuple of (saturation_score, metadata_dict)
+        saturation_score: 0-1 score (higher = less saturated)
+        metadata_dict: Contains data quality info, warnings, etc.
+    """
+    metadata = {
+        "data_quality": "medium",
+        "method": "kalshi_proxy",
+        "warnings": [],
+        "volume": volume,
+        "spread": spread
+    }
+    
     # Use the advanced formula: (log(spread)) / (log(volume))
     # This rewards *inefficient* (high spread) and *low attention* (low volume) markets
     spread = max(1, spread)
@@ -333,12 +1301,36 @@ def calculate_saturation_kalshi(volume, spread):
     spread_score = math.log(1 + spread)
     volume_penalty = math.log(1 + volume)
     
-    return spread_score / volume_penalty
+    saturation_score = spread_score / volume_penalty
+    
+    # Normalize to 0-1 range (clamp between 0.05 and 1.0)
+    saturation_score = max(0.05, min(1.0, saturation_score))
+    
+    # Add warnings for low data quality
+    if volume < 10:
+        metadata["warnings"].append("Low Kalshi market volume - saturation score may be unreliable")
+        metadata["data_quality"] = "low"
+    elif volume < 100:
+        metadata["warnings"].append("Moderate Kalshi market volume - saturation score may be less reliable")
+        metadata["data_quality"] = "medium"
+    else:
+        metadata["data_quality"] = "high"
+    
+    if verbose:
+        if metadata["warnings"]:
+            for warning in metadata["warnings"]:
+                print(f"  ⚠️  {warning}")
+    
+    return saturation_score, metadata
+
+# ============================================================================
+# CIVIC ENGINE API INTEGRATION
+# ============================================================================
 
 def get_civic_engine_races():
     """
     Fetches current state and federal elections from Civic Engine API
-    and returns a list of individual races.
+    and returns a list of individual races with classification.
     """
     try:
         # Get elections from Civic Engine API (verbose=False to reduce output)
@@ -354,12 +1346,17 @@ def get_civic_engine_races():
                 race_level = position.get('level', '')
                 
                 if race_name and race_level in ['STATE', 'FEDERAL']:
+                    # Classify election type
+                    election_type = classify_election_type(race_name, race_level)
+                    
                     races.append({
                         'name': race_name,
                         'level': race_level,
                         'day': election_day,
                         'election_name': election_data.get('name', ''),
-                        'race_id': race.get('id', '')
+                        'race_id': race.get('id', ''),
+                        'election_type': election_type,
+                        'election_type_desc': get_election_type_description(election_type)
                     })
         
         print(f"Fetched {len(races)} state/federal races from Civic Engine API")
@@ -369,14 +1366,26 @@ def get_civic_engine_races():
         print("Falling back to empty list")
         return []
 
-def process_races(max_races=None, verbose=True):
+# ============================================================================
+# MAIN PROCESSING PIPELINE
+# ============================================================================
+
+def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None):
     """
     Main function to process all races and generate a ranked list.
     
     Args:
         max_races: Maximum number of races to process (None for all)
         verbose: Whether to print progress during processing
+        nanda_year: Year to use for NANDA data (uses most recent if None)
     """
+    # Load NANDA data once for all races
+    if verbose:
+        print("Loading NANDA dataset...")
+    nanda_data = load_nanda_data(year=nanda_year)
+    if verbose:
+        print(f"Loaded NANDA data: {len(nanda_data)} FIPS codes")
+    
     # Get races from Civic Engine API
     races = get_civic_engine_races()
     
@@ -399,31 +1408,57 @@ def process_races(max_races=None, verbose=True):
         race_name = race['name']
         race_level = race['level']
         election_day = race.get('day', '')
+        election_type = race.get('election_type', ElectionType.UNKNOWN)
+        election_type_desc = race.get('election_type_desc', 'Unknown')
         
         if verbose:
             print(f"\n[{i}/{len(races)}] Processing: {race_name} ({race_level})")
+            print(f"  Type: {election_type_desc}")
         
         # This will hold the scores
         scores = {
             'name': race_name,
             'level': race_level,
             'day': election_day,
+            'election_type': election_type_desc,
             'source': '',
             'comp_score': 0,
             'sat_score': 0,
             'leverage_score': 0
         }
+        
+        # Determine election year for data matching
+        try:
+            election_year = int(election_day.split('-')[0]) if election_day else None
+        except (ValueError, AttributeError):
+            election_year = None
 
         # --- TIER 1: ATTEMPT KALSHI ---
-        market_series = get_kalshi_market(race_name)
+        market_series = get_kalshi_market(race_name, election_year=election_year, verbose=verbose)
 
         if market_series and 'markets' in market_series:
             scores['source'] = 'Kalshi'
             markets = market_series.get('markets', [])
             
+            # Get validation info if available
+            validation_info = market_series.get('_validation', {})
+            if validation_info:
+                scores['kalshi_validation'] = {
+                    'is_valid': validation_info.get('is_valid', True),
+                    'match_score': validation_info.get('match_score', 1.0),
+                    'warnings': validation_info.get('warnings', [])
+                }
+                # Add validation warnings to comp_warnings
+                if not scores.get('comp_warnings'):
+                    scores['comp_warnings'] = []
+                scores['comp_warnings'].extend(validation_info.get('warnings', []))
+            
             if markets:
                 # 1. Calculate Competitiveness
                 try:
+                    # Get market volume for data quality assessment
+                    market_volume = market_series.get('total_series_volume', 0) or 0
+                    
                     if len(markets) <= 2:  # Binary general election
                         market = markets[0]
                         price = market.get('last_price') or market.get('yes_bid', 50)
@@ -450,23 +1485,67 @@ def process_races(max_races=None, verbose=True):
                             spread = max(1, yes_ask - yes_bid)
                         else:
                             spread = 1
+                    
+                    # Set competitiveness data quality based on market volume
+                    if market_volume < 10:
+                        scores['comp_data_quality'] = 'low'
+                        scores['comp_warnings'] = ['Low Kalshi market volume - competitiveness may be unreliable']
+                    elif market_volume < 100:
+                        scores['comp_data_quality'] = 'medium'
+                    else:
+                        scores['comp_data_quality'] = 'high'
+                    
+                    scores.setdefault('comp_warnings', [])
 
                     # 2. Calculate Saturation
                     if race_level == 'FEDERAL':
                         # Federal races always use FEC data
-                        # Determine cycle from election year
+                        # Determine cycle from election year using improved calculation
                         try:
-                            election_year = int(election_day.split('-')[0]) if election_day else 2024
-                            # FEC cycles are typically even years, use the cycle before the election
-                            cycle = election_year - 1 if election_year % 2 == 1 else election_year
+                            from datetime import date
+                            current_year = date.today().year
+                            cycle_year = election_year if election_year else current_year
+                            
+                            # FEC cycles are 2-year periods ending in even years
+                            if cycle_year % 2 == 0:
+                                cycle = cycle_year  # Even year = cycle year
+                            else:
+                                cycle = cycle_year - 1  # Odd year = previous even year cycle
+                            
+                            # Validate cycle is reasonable
+                            if cycle > current_year:
+                                # Future cycle, use most recent completed cycle
+                                if current_year % 2 == 0:
+                                    cycle = current_year
+                                else:
+                                    cycle = current_year - 1
+                            
+                            if cycle < 2018:
+                                cycle = 2024  # Default to 2024 cycle
+                                
                         except (ValueError, AttributeError):
                             cycle = 2024
+                        
                         scores['sat_score'] = calculate_saturation_fec(race_name, cycle=cycle, verbose=verbose)
                         scores['source'] += " + FEC"
+                        scores['sat_data_quality'] = 'high'  # FEC data is reliable
+                        scores['fec_cycle'] = cycle  # Store cycle for reference
+                        if verbose:
+                            print(f"  FEC: Using cycle {cycle} for election year {election_year}")
                     else:
-                        # State races must use Kalshi proxy
-                        volume = market_series.get('total_series_volume', 0)
-                        scores['sat_score'] = calculate_saturation_kalshi(volume, spread)
+                        # State races: Use Kalshi proxy for all states
+                        volume = market_series.get('total_series_volume', 0) or 0
+                        sat_score, sat_metadata = calculate_saturation_kalshi(volume, spread, verbose=verbose)
+                        scores['sat_score'] = sat_score
+                        scores['sat_data_quality'] = sat_metadata.get('data_quality', 'medium')
+                        scores['sat_warnings'] = sat_metadata.get('warnings', [])
+                        scores['sat_method'] = 'kalshi_proxy'  # Mark as proxy method
+                        scores['source'] += " + Kalshi (proxy: using market volume/spread as estimate)"
+                        if sat_metadata.get('warnings'):
+                            scores['sat_warnings'] = sat_metadata['warnings']
+                        # Add explanation to warnings if not already present
+                        if 'Kalshi market volume/spread used as proxy' not in str(scores['sat_warnings']):
+                            scores['sat_warnings'].insert(0, 'Kalshi market volume/spread used as proxy for campaign finance data (not actual fundraising data)')
                         
                     if verbose:
                         print(f"  ✓ Found Kalshi market: {len(markets)} markets, comp={scores['comp_score']:.3f}")
@@ -484,36 +1563,146 @@ def process_races(max_races=None, verbose=True):
         if not market_series or 'markets' not in market_series or not market_series.get('markets'):
             scores['source'] = 'Civic Engine'
             
-            # 1. Calculate Competitiveness (default to moderate for unknown races)
-            # In a real implementation, you might use historical data or polls
-            scores['comp_score'] = 0.5  # Default moderate competitiveness
+            # 1. Calculate Competitiveness
+            # Try historical data first for all race types (more accurate than NANDA when available)
+            # Historical data works for any race type that has positions in Civic Engine
+            nanda_fallback = False
+            try:
+                comp_score, comp_metadata = calculate_competitiveness_from_historical(
+                    race_name, election_type, verbose=verbose
+                )
+                
+                # Only use historical data if we got actual results (not just default/fallback)
+                if comp_metadata.get('historical_elections_found', 0) > 0:
+                    scores['comp_score'] = comp_score
+                    scores['comp_data_quality'] = comp_metadata.get('data_quality', 'low')
+                    scores['comp_warnings'] = comp_metadata.get('warnings', [])
+                    scores['source'] += " + Historical"
+                    if verbose:
+                        print(f"  ✓ Using historical data for competitiveness: {scores['comp_score']:.3f}")
+                        if comp_metadata.get('warnings'):
+                            for warning in comp_metadata['warnings']:
+                                print(f"  ⚠️  {warning}")
+                    # Skip fallback to NANDA since we have historical data
+                    nanda_fallback = False
+                else:
+                    # No historical data found, fall back to NANDA
+                    nanda_fallback = True
+                    if verbose:
+                        print(f"  → No historical data available, falling back to NANDA")
+            except Exception as e:
+                if verbose:
+                    print(f"  ✗ Error calculating historical competitiveness: {e}")
+                nanda_fallback = True
+            
+            # Fall back to NANDA if historical data wasn't available
+            if nanda_fallback:
+                if nanda_data:
+                    try:
+                        scores['comp_score'] = calculate_competitiveness_nanda(
+                            race_name, 
+                            election_type, 
+                            nanda_data, 
+                            year=election_year,
+                            verbose=verbose
+                        )
+                        scores['source'] += " + NANDA"
+                        scores['comp_data_quality'] = 'medium'
+                        if not scores.get('comp_warnings'):
+                            scores['comp_warnings'] = []
+                        scores['comp_warnings'].append('Using state-level NANDA data (not district-specific)')
+                        if verbose:
+                            print(f"  ✓ Using NANDA for competitiveness: {scores['comp_score']:.3f}")
+                    except Exception as e2:
+                        if verbose:
+                            print(f"  ✗ Error calculating NANDA competitiveness: {e2}")
+                        scores['comp_score'] = 0.5
+                        scores['comp_data_quality'] = 'low'
+                        scores['comp_warnings'] = ['No competitiveness data available']
+                else:
+                    scores['comp_score'] = 0.5
+                    scores['comp_data_quality'] = 'low'
+                    scores['comp_warnings'] = ['No competitiveness data available']
+                    if verbose:
+                        print(f"  → No NANDA data available, using default competitiveness")
             
             # 2. Calculate Saturation
             if race_level == 'FEDERAL':
-                # Determine cycle from election year
+                # Determine cycle from election year using improved calculation
                 try:
-                    election_year = int(election_day.split('-')[0]) if election_day else 2024
-                    # FEC cycles are typically even years, use the cycle before the election
-                    cycle = election_year - 1 if election_year % 2 == 1 else election_year
+                    from datetime import date
+                    current_year = date.today().year
+                    cycle_year = election_year if election_year else current_year
+                    
+                    # FEC cycles are 2-year periods ending in even years
+                    if cycle_year % 2 == 0:
+                        cycle = cycle_year  # Even year = cycle year
+                    else:
+                        cycle = cycle_year - 1  # Odd year = previous even year cycle
+                    
+                    # Validate cycle is reasonable
+                    if cycle > current_year:
+                        # Future cycle, use most recent completed cycle
+                        if current_year % 2 == 0:
+                            cycle = current_year
+                        else:
+                            cycle = current_year - 1
+                    
+                    if cycle < 2018:
+                        cycle = 2024  # Default to 2024 cycle
+                        if verbose:
+                            print(f"  FEC: Election year {cycle_year} too old, using default cycle {cycle}")
+                            
                 except (ValueError, AttributeError):
                     cycle = 2024
+                
                 scores['sat_score'] = calculate_saturation_fec(race_name, cycle=cycle, verbose=verbose)
                 scores['source'] += " + FEC"
+                scores['sat_data_quality'] = 'high'  # FEC data is reliable
+                scores['fec_cycle'] = cycle  # Store cycle for reference
+                if verbose:
+                    print(f"  FEC: Using cycle {cycle} for election year {election_year}")
             else:
-                # No Kalshi market = low visibility = HIGH score
-                # This is an *un-saturated* race by definition
-                scores['sat_score'] = 1.0
+                # State races: No Kalshi market = no saturation data available
+                scores['sat_score'] = None  # Mark as unavailable
+                scores['sat_data_quality'] = 'none'
+                scores['sat_warnings'] = ['No saturation data available - Kalshi market not found']
+                if verbose:
+                    print(f"  ⚠️  No saturation data available for state race (no Kalshi market)")
                 
             if verbose:
-                print(f"  → No Kalshi market found, using defaults")
+                data_sources = []
+                if 'NANDA' in scores['source']:
+                    data_sources.append("NANDA (competitiveness)")
+                if 'FEC' in scores['source']:
+                    data_sources.append(scores['source'].split(' + ')[-1] + " (saturation)")
+                if not data_sources:
+                    data_sources.append("Defaults")
+                print(f"  → Data sources: {', '.join(data_sources)}")
 
         # --- FINAL LEVERAGE SCORE ---
         # We also add an Impact_Score (Federal/State > Local)
         impact_score = 1.0 if race_level == 'FEDERAL' else 0.8
         
+        # Handle missing saturation score (state races without Kalshi)
+        sat_score = scores.get('sat_score')
+        if sat_score is None:
+            # If no saturation data, exclude from ranking or use a default
+            # For now, we'll use a moderate default but flag it
+            sat_score = 0.5
+            if 'sat_warnings' not in scores:
+                scores['sat_warnings'] = []
+            scores['sat_warnings'].append('Using default saturation (no data available)')
+        
         scores['leverage_score'] = (
-            scores['comp_score'] * scores['sat_score'] * impact_score
+            scores['comp_score'] * sat_score * impact_score
         )
+        
+        # Store data quality info
+        scores.setdefault('comp_data_quality', 'unknown')
+        scores.setdefault('sat_data_quality', 'unknown')
+        scores.setdefault('comp_warnings', [])
+        scores.setdefault('sat_warnings', [])
         
         recommendations.append(scores)
 
@@ -528,11 +1717,62 @@ def process_races(max_races=None, verbose=True):
     top_n = min(20, len(ranked_list))
     for i, r in enumerate(ranked_list[:top_n], 1):
         print(f"\n#{i}: {r['name']} ({r['level']})")
+        print(f"  Type: {r.get('election_type', 'Unknown')}")
         print(f"  Election Day: {r.get('day', 'N/A')}")
         print(f"  Leverage Score: {r['leverage_score']:.3f}")
-        print(f"  Source: {r['source']}")
-        print(f"    > Competitiveness: {r['comp_score']:.3f}")
-        print(f"    > Saturation/Penalty: {r['sat_score']:.3f}")
+        print(f"  Data Sources: {r['source']}")
+        print(f"    > Competitiveness: {r['comp_score']:.3f} (quality: {r.get('comp_data_quality', 'unknown')})")
+        
+        # Show saturation score with data quality and warnings
+        sat_score = r.get('sat_score')
+        sat_method = r.get('sat_method', '')
+        if sat_score is not None:
+            method_note = ""
+            if sat_method == 'kalshi_proxy':
+                method_note = " [Kalshi proxy - not actual finance data]"
+            print(f"    > Saturation: {sat_score:.3f} (quality: {r.get('sat_data_quality', 'unknown')}){method_note}")
+        else:
+            print(f"    > Saturation: N/A (no data available)")
+        
+        # Show data source explanation
+        source_parts = r.get('source', '').split(' + ')
+        if 'Kalshi (proxy' in r.get('source', ''):
+            print(f"    📊 Note: State race saturation uses Kalshi market activity (volume/spread) as a proxy")
+            print(f"       for actual campaign finance data. This estimates saturation based on market attention,")
+            print(f"       not real fundraising amounts.")
+        
+        # Show Kalshi validation info if available
+        kalshi_validation = r.get('kalshi_validation', {})
+        if kalshi_validation:
+            is_valid = kalshi_validation.get('is_valid', True)
+            match_score = kalshi_validation.get('match_score', 1.0)
+            validation_warnings = kalshi_validation.get('warnings', [])
+            
+            if is_valid:
+                print(f"    ✓ Kalshi Market Validation: GOOD MATCH (score: {match_score:.2f})")
+            else:
+                print(f"    ⚠️  Kalshi Market Validation: POOR MATCH (score: {match_score:.2f})")
+            
+            if validation_warnings:
+                print(f"    📋 Market Validation Details:")
+                for warning in validation_warnings:
+                    print(f"       - {warning}")
+        
+        # Show FEC cycle info if available
+        if r.get('fec_cycle'):
+            print(f"    📅 FEC Cycle: {r['fec_cycle']}")
+        
+        # Show warnings
+        all_warnings = []
+        if r.get('comp_warnings'):
+            all_warnings.extend(r['comp_warnings'])
+        if r.get('sat_warnings'):
+            all_warnings.extend(r['sat_warnings'])
+        
+        if all_warnings:
+            print(f"    ⚠️  Warnings:")
+            for warning in all_warnings:
+                print(f"       - {warning}")
     
     if len(ranked_list) > top_n:
         print(f"\n... and {len(ranked_list) - top_n} more races")

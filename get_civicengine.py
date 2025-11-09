@@ -1,9 +1,3 @@
-"""
-Civic Engine GraphQL API Client
-
-This module provides functionality to query the Civic Engine GraphQL API.
-"""
-
 import requests
 from typing import Dict, Any, Optional
 from datetime import date
