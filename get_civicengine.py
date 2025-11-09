@@ -77,7 +77,8 @@ def query_civicengine(
 
 def get_current_state_federal_elections(
     token: Optional[str] = None,
-    max_elections: int = 100
+    max_elections: int = 100,
+    verbose: bool = False
 ) -> Dict[str, Any]:
     """
     Get all currently ongoing elections filtered to state or federal level.
@@ -161,10 +162,11 @@ def get_current_state_federal_elections(
         election_name = election.get("name")
         election_day = election.get("electionDay")
 
-        print ("Election data: ", election)
-        print ("Election id: ", election_id)
-        print ("Election name: ", election_name)
-        print ("Election day: ", election_day)
+        if verbose:
+            print ("Election data: ", election)
+            print ("Election id: ", election_id)
+            print ("Election name: ", election_name)
+            print ("Election day: ", election_day)
         
         # Get races and filter by STATE or FEDERAL level
         races = election.get("races", {}).get("nodes", [])
@@ -196,7 +198,8 @@ def get_current_state_federal_elections(
                 "total_race_count": len(races)
             }
     
-    print ("All levels: ", all_levels)
+    if verbose:
+        print ("All levels: ", all_levels)
     return filtered_elections
 
 
