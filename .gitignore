@@ -34,7 +34,3 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-
-# big file
-issue_alignment/candidate_stances1.csv
-issue_alignment/candidate_data1.csv
