@@ -255,7 +255,7 @@ def main():
     ]
 
     scored_df.to_csv("issue_relevance_scores.csv", index=False)
-    top = scored_df.sort_values(by="similarity_score", ascending=False).head(80).copy()
+    top = scored_df.sort_values(by="similarity_score", ascending=False).head(20).copy()
     top["similarity_score"] = top["similarity_score"].map(lambda x: f"{x:.3f}")
     display_cols = [
         "candidate_name",
@@ -301,7 +301,6 @@ def main():
         print("--------------------------------") 
 
     top["gpt_alignment_score"] = gpt_scores
-    top["issue_relevance_score"] = top["gpt_alignment_score"]
 
     top.to_csv("issue_relevance_scores.csv", index=False)
     #print ("All issues: ", get_all_issues())
