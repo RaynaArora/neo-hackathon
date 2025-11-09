@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+import json
 import numpy as np
 import pandas as pd
 from openai import OpenAI
@@ -70,6 +71,7 @@ def score_candidates_against_preferences(
 
 CANDIDATE_STANCES_CSV = "issue_alignment/candidate_stances1.csv"
 CANDIDATE_DATA_CSV = "issue_alignment/candidate_data1.csv"
+ELECTIONS_JSON = "issue_alignment/elections.json"
 EMBED_DIM = None  # updated dynamically
 
 
@@ -138,6 +140,45 @@ def get_alignment_rating(user_summary: str, candidate_statements: str) -> int:
     return 0
 
 
+def load_candidacy_election_details(
+    elections_path: str = ELECTIONS_JSON,
+) -> Dict[str, Dict[str, Optional[str]]]:
+    """Map candidacy IDs to their election metadata (name, position, day)."""
+    with open(elections_path, encoding="utf-8") as elections_file:
+        data = json.load(elections_file)
+
+    if isinstance(data, dict):
+        elections_iter = data.values()
+    elif isinstance(data, list):
+        elections_iter = data
+    else:
+        raise ValueError("Unexpected elections.json structure; expected dict or list.")
+
+    mapping: Dict[str, Dict[str, Optional[str]]] = {}
+    for election in elections_iter:
+        election_day = election.get("electionDay")
+        election_name = election.get("name")
+        for race in election.get("races", []):
+            position_name = None
+            race_name = race.get("name")
+            race_level = None
+            position = race.get("position")
+            if isinstance(position, dict):
+                position_name = position.get("name")
+                race_level = position.get("level")
+            for candidacy in race.get("candidacies", []):
+                candidacy_id = candidacy.get("id")
+                if candidacy_id and candidacy_id not in mapping:
+                    mapping[candidacy_id] = {
+                        "election_name": election_name,
+                        "race_name": race_name or position_name,
+                        "race_level": race_level,
+                        "position": position_name,
+                        "election_day": election_day,
+                    }
+    return mapping
+
+
 def get_all_issues():
     """Get all issues from the candidate embeddings."""
     candidate_embeddings, statements_map = load_candidate_embeddings()
@@ -156,6 +197,7 @@ def print_all_abortion_statements():
 def main():
     candidate_embeddings, statements_map = load_candidate_embeddings()
     candidate_data = pd.read_csv(CANDIDATE_DATA_CSV)
+    election_details = load_candidacy_election_details()
     user_prefs = [
         #UserPreference(issue="ECONOMY", importance=8, statement="Boost small business support."),
         #UserPreference(issue="HEALTHCARE", importance=6, statement="Expand affordable care."),
@@ -177,13 +219,54 @@ def main():
             for candidate_id, score in scores.items()
         ]
     )
-    scored_df = scored_df.merge(candidate_data[["candidate_id", "candidate_name"]], on="candidate_id", how="left")
-    scored_df = scored_df[["candidate_id", "candidate_name", "similarity_score", "statements"]]
+    
+    scored_df = scored_df.merge(
+        candidate_data[["candidate_id", "candidate_name"]],
+        on="candidate_id",
+        how="left",
+    )
+    scored_df["election_name"] = scored_df["candidate_id"].map(
+        lambda cid: election_details.get(cid, {}).get("election_name")
+    )
+    scored_df["position"] = scored_df["candidate_id"].map(
+        lambda cid: election_details.get(cid, {}).get("position")
+    )
+    scored_df["election_day"] = scored_df["candidate_id"].map(
+        lambda cid: election_details.get(cid, {}).get("election_day")
+    )
+    scored_df["race_name"] = scored_df["candidate_id"].map(
+        lambda cid: election_details.get(cid, {}).get("race_name")
+    )
+    scored_df["race_level"] = scored_df["candidate_id"].map(
+        lambda cid: election_details.get(cid, {}).get("race_level")
+    )
+    scored_df = scored_df[
+        [
+            "candidate_id",
+            "candidate_name",
+            "election_name",
+            "race_name",
+            "race_level",
+            "position",
+            "election_day",
+            "similarity_score",
+            "statements",
+        ]
+    ]
 
     scored_df.to_csv("issue_relevance_scores.csv", index=False)
     top = scored_df.sort_values(by="similarity_score", ascending=False).head(20).copy()
     top["similarity_score"] = top["similarity_score"].map(lambda x: f"{x:.3f}")
-    display_cols = ["candidate_name", "similarity_score", "statements"]
+    display_cols = [
+        "candidate_name",
+        "election_name",
+        "race_name",
+        "race_level",
+        "position",
+        "election_day",
+        "similarity_score",
+        "statements",
+    ]
     print("\nTop", len(top), "Candidates by Similarity:\n")
     user_summary = "\n".join(
         f"Issue: {pref.issue}, Importance: {pref.importance}, Statement: {pref.statement}"
@@ -207,13 +290,17 @@ def main():
         rating = get_alignment_rating(user_summary, candidate_statements)
         gpt_scores.append(rating)
         print(f"Candidate: {row['candidate_name']}")
+        print(f"Election: {row.get('election_name', 'N/A') or 'N/A'}")
+        print(f"Race: {row.get('race_name', 'N/A') or 'N/A'}")
+        print(f"Level: {row.get('race_level', 'N/A') or 'N/A'}")
+        print(f"Position: {row.get('position', 'N/A') or 'N/A'}")
+        print(f"Election Day: {row.get('election_day', 'N/A') or 'N/A'}")
         print(f"Traditional Similarity Score: {row['similarity_score']}")
         print(f"GPT Alignment Rating: {rating}")
         print(f"Statements:\n{candidate_statements}")
-        print("--------------------------------")
+        print("--------------------------------") 
 
     top["gpt_alignment_score"] = gpt_scores
-    top["issue_relevance_score"] = top["gpt_alignment_score"]
 
     top.to_csv("issue_relevance_scores.csv", index=False)
     #print ("All issues: ", get_all_issues())
