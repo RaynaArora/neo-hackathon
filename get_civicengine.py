@@ -77,7 +77,7 @@ def query_civicengine(
 
 def get_current_state_federal_elections(
     token: Optional[str] = None,
-    max_elections: int = 100
+    max_elections: int = 10000
 ) -> Dict[str, Any]:
     """
     Get all currently ongoing elections filtered to state or federal level.
