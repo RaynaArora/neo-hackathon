@@ -95,7 +95,7 @@ def get_elections_with_candidate_stances(
                 "name": election.get("name"),
                 "electionDay": election.get("electionDay")
             }
-            day += timedelta(days=1)
+        day += timedelta(days=1)
 
     races_query = """
     query GetElectionRacesWithStances($electionId: ID!, $first: Int!) {
