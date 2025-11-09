@@ -3,7 +3,7 @@ Election Donation Recommendation System
 
 This module calculates leverage scores for election races by combining:
 1. Competitiveness: How close the race is (from Kalshi markets or NANDA party data)
-2. Saturation: How much fundraising has already occurred (from FEC/OCPF/Kalshi)
+2. Saturation: How much fundraising has already occurred (from FEC/Kalshi)
 3. Impact: Federal vs State level weighting
 
 Data Sources:
@@ -835,34 +835,94 @@ def calculate_competitiveness_general(price):
     return (1 - abs(price - 50) / 50)
 
 def calculate_competitiveness_primary(markets):
-    """Calculates competitiveness for a multi-candidate primary."""
+    """
+    Calculates competitiveness for a multi-candidate primary using entropy-based measure.
+    
+    Uses entropy: -Σ(p_i * log(p_i)) where p_i is the probability/price of candidate i.
+    Higher entropy = more competitive (more evenly distributed probabilities).
+    
+    Also considers:
+    - Number of candidates (more candidates = potentially more competitive due to vote splitting)
+    - Gap between top candidates (smaller gap = more competitive)
+    
+    Args:
+        markets: List of market dictionaries for each candidate
+    
+    Returns:
+        Competitiveness score between 0 and 1 (higher = more competitive)
+    """
     if not markets or len(markets) < 2:
-        return 0
+        return 0.0
     
     # Try to get prices from various possible fields
     prices = []
     for m in markets:
         price = m.get('last_price') or m.get('yes_bid') or m.get('yes_ask')
-        if price:
+        if price is not None:
             prices.append(price)
     
     if len(prices) < 2:
-        # If we don't have enough prices, try to estimate from bid/ask
-        # This is a fallback for markets without last_price
-        return 0.3  # Default moderate competitiveness
-        
-    prices = sorted(prices, reverse=True)
-    p1, p2 = prices[0], prices[1]
+        # Not enough price data - estimate from available data
+        if len(prices) == 1:
+            # Only one candidate has price data - use that to estimate
+            # If one candidate is heavily favored (high price), less competitive
+            single_price = prices[0]
+            if single_price > 100:
+                single_price = single_price / 100
+            # Inverse relationship: higher price = less competitive
+            return max(0.1, min(0.9, 1 - (single_price / 100)))
+        else:
+            # No price data at all - can't calculate competitiveness
+            # Return moderate score instead of arbitrary 0.3
+            # This indicates uncertainty rather than a specific competitiveness level
+            return 0.5  # Moderate/unknown competitiveness
     
-    # Normalize prices to 0-100 range if needed
-    if p1 > 100:
-        p1 = p1 / 100
-    if p2 > 100:
-        p2 = p2 / 100
+    # Normalize prices to 0-100 range if needed and calculate probabilities
+    normalized_prices = []
+    for p in prices:
+        if p > 100:
+            p = p / 100
+        normalized_prices.append(max(0.01, min(99, p)))  # Clamp to avoid log(0)
     
-    leader_score = max(0, (1 - (p1 / 100)))
-    gap_score = max(0, (1 - ((p1 - p2) / 100)))
-    return leader_score * gap_score
+    # Calculate entropy-based competitiveness
+    # Higher entropy = more evenly distributed = more competitive
+    total = sum(normalized_prices)
+    if total == 0:
+        return 0.5  # Can't determine
+    
+    # Normalize to probabilities
+    probabilities = [p / total for p in normalized_prices]
+    
+    # Calculate entropy: -Σ(p_i * log(p_i))
+    # Maximum entropy occurs when all probabilities are equal
+    entropy = 0.0
+    for p in probabilities:
+        if p > 0:
+            entropy -= p * math.log(p)
+    
+    # Normalize entropy to 0-1 range
+    # Maximum entropy for n candidates is log(n)
+    max_entropy = math.log(len(probabilities))
+    entropy_score = entropy / max_entropy if max_entropy > 0 else 0.0
+    
+    # Also consider gap between top 2 candidates
+    sorted_prices = sorted(normalized_prices, reverse=True)
+    p1, p2 = sorted_prices[0], sorted_prices[1]
+    gap_score = 1 - ((p1 - p2) / 100)  # Smaller gap = higher score
+    gap_score = max(0.0, min(1.0, gap_score))
+    
+    # Combine entropy and gap scores
+    # Weight entropy more heavily (60%) since it considers all candidates
+    # Weight gap score less (40%) since it only considers top 2
+    competitiveness = 0.6 * entropy_score + 0.4 * gap_score
+    
+    # Adjust for number of candidates (more candidates = potentially more competitive)
+    num_candidates = len(markets)
+    if num_candidates > 3:
+        # Boost competitiveness slightly for races with many candidates (vote splitting)
+        competitiveness = min(1.0, competitiveness * 1.1)
+    
+    return max(0.0, min(1.0, competitiveness))
 
 # ============================================================================
 # FEC API INTEGRATION
@@ -968,59 +1028,113 @@ def get_fec_candidates_total_receipts(office: str, state: str, district: Optiona
         if office == 'H' and district is not None:
             params['district'] = str(district).zfill(2)  # FEC expects 2-digit district
         
-        try:
-            response = requests.get(base_url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            candidates = data.get('results', [])
-            
-            if verbose and candidates:
-                print(f"  FEC: Found {len(candidates)} candidates for {state} {office}{district or ''} (cycle {check_cycle})")
-            
-            for candidate in candidates:
-                candidate_id = candidate.get('candidate_id')
-                if not candidate_id or candidate_id in candidate_ids_seen:
-                    continue
+        # Add retry logic for transient failures
+        max_retries = 3
+        retry_delay = 1  # Start with 1 second
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(base_url, params=params, timeout=10)
                 
-                candidate_ids_seen.add(candidate_id)
-                
-                # Try to get totals for this candidate across multiple cycles
-                max_receipts = 0.0
-                for total_cycle in cycles_to_check:
-                    totals_url = f"https://api.open.fec.gov/v1/candidate/{candidate_id}/totals/"
-                    totals_params = {
-                        'api_key': FEC_TOKEN,
-                        'cycle': total_cycle,
-                        'per_page': 100  # Get all totals for this cycle
-                    }
-                    
-                    try:
-                        totals_response = requests.get(totals_url, params=totals_params, timeout=10)
-                        totals_response.raise_for_status()
-                        totals_data = totals_response.json()
-                        
-                        totals_list = totals_data.get('results', [])
-                        for total in totals_list:
-                            receipts = total.get('receipts', 0) or 0
-                            max_receipts = max(max_receipts, float(receipts))
-                    except requests.RequestException:
-                        # If we can't get totals for this cycle, continue
+                # Handle rate limiting (429)
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                        if verbose:
+                            print(f"  FEC: Rate limited (cycle {check_cycle}), waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                        import time
+                        time.sleep(wait_time)
                         continue
+                    else:
+                        response.raise_for_status()
                 
-                if max_receipts > 0:
-                    total_receipts += max_receipts
+                response.raise_for_status()
+                data = response.json()
+                
+                candidates = data.get('results', [])
+                
+                if verbose and candidates:
+                    print(f"  FEC: Found {len(candidates)} candidates for {state} {office}{district or ''} (cycle {check_cycle})")
+                
+                # Process candidates
+                for candidate in candidates:
+                    candidate_id = candidate.get('candidate_id')
+                    if not candidate_id or candidate_id in candidate_ids_seen:
+                        continue
+                    
+                    candidate_ids_seen.add(candidate_id)
+                    
+                    # Try to get totals for this candidate across multiple cycles
+                    max_receipts = 0.0
+                    for total_cycle in cycles_to_check:
+                        totals_url = f"https://api.open.fec.gov/v1/candidate/{candidate_id}/totals/"
+                        totals_params = {
+                            'api_key': FEC_TOKEN,
+                            'cycle': total_cycle,
+                            'per_page': 100  # Get all totals for this cycle
+                        }
+                        
+                        # Retry logic for totals endpoint too
+                        for totals_attempt in range(max_retries):
+                            try:
+                                totals_response = requests.get(totals_url, params=totals_params, timeout=10)
+                                
+                                if totals_response.status_code == 429:
+                                    if totals_attempt < max_retries - 1:
+                                        wait_time = retry_delay * (2 ** totals_attempt)
+                                        import time
+                                        time.sleep(wait_time)
+                                        continue
+                                    else:
+                                        totals_response.raise_for_status()
+                                
+                                totals_response.raise_for_status()
+                                totals_data = totals_response.json()
+                                
+                                totals_list = totals_data.get('results', [])
+                                for total in totals_list:
+                                    receipts = total.get('receipts', 0) or 0
+                                    max_receipts = max(max_receipts, float(receipts))
+                                break  # Success, exit retry loop
+                            except requests.RequestException as totals_e:
+                                if totals_attempt < max_retries - 1:
+                                    # Retry with exponential backoff
+                                    wait_time = retry_delay * (2 ** totals_attempt)
+                                    import time
+                                    time.sleep(wait_time)
+                                else:
+                                    # Last attempt failed, skip this cycle
+                                    if verbose:
+                                        print(f"  FEC: Could not get totals for {candidate_id} cycle {total_cycle} after {max_retries} attempts: {totals_e}")
+                                    continue
+                    
+                    if max_receipts > 0:
+                        total_receipts += max_receipts
+                        if verbose:
+                            print(f"  FEC: Candidate {candidate_id}: ${max_receipts:,.0f}")
+                
+                # If we got data (even if empty), break out of retry loop
+                break
+                
+            except requests.RequestException as e:
+                if attempt < max_retries - 1:
+                    # Retry with exponential backoff
+                    wait_time = retry_delay * (2 ** attempt)
                     if verbose:
-                        print(f"  FEC: Candidate {candidate_id}: ${max_receipts:,.0f}")
-            
-        except requests.RequestException as e:
-            if verbose:
-                print(f"  FEC API error for cycle {check_cycle}: {e}")
-            continue
-        except (KeyError, ValueError, TypeError) as e:
-            if verbose:
-                print(f"  FEC API parsing error for cycle {check_cycle}: {e}")
-            continue
+                        print(f"  FEC: Request error for cycle {check_cycle} (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}")
+                    import time
+                    time.sleep(wait_time)
+                else:
+                    # Last attempt failed
+                    if verbose:
+                        print(f"  FEC API error for cycle {check_cycle} after {max_retries} attempts: {e}")
+                    # Continue to next cycle instead of returning 0
+                    continue
+            except (KeyError, ValueError, TypeError) as e:
+                if verbose:
+                    print(f"  FEC API parsing error for cycle {check_cycle}: {e}")
+                # Don't retry on parsing errors
+                break
     
     if verbose and total_receipts > 0:
         print(f"  FEC: Total receipts: ${total_receipts:,.0f}")
@@ -1028,7 +1142,7 @@ def get_fec_candidates_total_receipts(office: str, state: str, district: Optiona
     return total_receipts
 
 
-def calculate_saturation_fec(race_name: str, cycle: int = 2024, verbose: bool = False) -> float:
+def calculate_saturation_fec(race_name: str, cycle: int = 2024, verbose: bool = False) -> Tuple[float, Dict[str, Any]]:
     """
     Gets FEC data for Federal races and calculates saturation score.
     
@@ -1049,8 +1163,19 @@ def calculate_saturation_fec(race_name: str, cycle: int = 2024, verbose: bool = 
         verbose: Whether to print debug information
     
     Returns:
-        Saturation score between 0 and 1 (higher = less saturated)
+        Tuple of (saturation_score, metadata_dict)
+        saturation_score: 0-1 score (higher = less saturated)
+        metadata_dict: Contains data quality info, warnings, error flags, etc.
     """
+    metadata = {
+        "data_quality": "high",
+        "method": "fec",
+        "cycle": cycle,
+        "warnings": [],
+        "error": None,
+        "total_receipts": 0.0
+    }
+    
     # Parse race name to get office, state, district
     race_info = parse_race_name(race_name)
     
@@ -1058,26 +1183,52 @@ def calculate_saturation_fec(race_name: str, cycle: int = 2024, verbose: bool = 
         # Can't parse race, return default moderate score
         if verbose:
             print(f"  FEC: Could not parse race name: {race_name}")
-        return 1 / math.log(1 + 10_000_000)  # Default to $10M equivalent
+        metadata["data_quality"] = "low"
+        metadata["warnings"].append("Could not parse race name")
+        default_score = 1 / math.log(1 + 10_000_000)  # Default to $10M equivalent
+        return default_score, metadata
     
     if verbose:
         print(f"  FEC: Querying {race_info['office']} race in {race_info['state']}" + 
               (f" District {race_info['district']}" if race_info['district'] else ""))
     
-    # Get total receipts for the race
-    total_receipts = get_fec_candidates_total_receipts(
-        office=race_info['office'],
-        state=race_info['state'],
-        district=race_info.get('district'),
-        cycle=cycle,
-        verbose=verbose
-    )
+    # Get total receipts for the race (with retry logic built in)
+    try:
+        total_receipts = get_fec_candidates_total_receipts(
+            office=race_info['office'],
+            state=race_info['state'],
+            district=race_info.get('district'),
+            cycle=cycle,
+            verbose=verbose
+        )
+        metadata["total_receipts"] = total_receipts
+    except Exception as e:
+        # API error - distinguish from "no data"
+        metadata["error"] = str(e)
+        metadata["data_quality"] = "none"
+        metadata["warnings"].append(f"FEC API error: {e}")
+        if verbose:
+            print(f"  FEC: Error querying FEC API: {e}")
+        # Return conservative default instead of treating as "no fundraising"
+        return 0.5, metadata  # Conservative default
     
     if total_receipts == 0:
-        # No fundraising data found, treat as low saturation
+        # No fundraising data found - could be legitimate (no candidates) or error
+        # Check if we're in a valid cycle to distinguish
+        from datetime import date
+        current_year = date.today().year
+        if cycle > current_year:
+            metadata["warnings"].append(f"Future cycle {cycle} - data may not exist yet")
+            metadata["data_quality"] = "low"
+        elif cycle < 2018:
+            metadata["warnings"].append(f"Old cycle {cycle} - data may be incomplete")
+            metadata["data_quality"] = "low"
+        
+        # Treat as low saturation (no fundraising yet)
         if verbose:
             print(f"  FEC: No fundraising data found, treating as low saturation")
-        return 1.0
+        metadata["warnings"].append("No fundraising data found - may indicate no candidates or incomplete data")
+        return 1.0, metadata
     
     # Calculate saturation score: inverse log relationship
     # Using log ensures diminishing returns and prevents extreme values
@@ -1089,7 +1240,7 @@ def calculate_saturation_fec(race_name: str, cycle: int = 2024, verbose: bool = 
     if verbose:
         print(f"  FEC: Saturation score: {saturation_score:.3f} (receipts: ${total_receipts:,.0f})")
     
-    return saturation_score
+    return saturation_score, metadata
 
 # ============================================================================
 # Note: OCPF (Massachusetts campaign finance) data has been removed.
@@ -1157,10 +1308,18 @@ def calculate_saturation_kalshi(volume, spread, verbose: bool = False) -> Tuple[
 # CIVIC ENGINE API INTEGRATION
 # ============================================================================
 
-def get_civic_engine_races():
+def get_civic_engine_races(max_months_ahead: Optional[int] = 18, filter_past: bool = True):
     """
     Fetches current state and federal elections from Civic Engine API
     and returns a list of individual races with classification.
+    
+    Args:
+        max_months_ahead: Maximum months into the future to include races (default: 18)
+                         None = no limit
+        filter_past: Whether to filter out past elections (default: True)
+    
+    Returns:
+        List of race dictionaries with classification and metadata
     """
     try:
         # Get elections from Civic Engine API (verbose=False to reduce output)
@@ -1168,8 +1327,29 @@ def get_civic_engine_races():
         
         # Extract individual races from elections
         races = []
+        today = datetime.now().date()
+        
         for election_id, election_data in elections_dict.items():
             election_day = election_data.get('electionDay', '')
+            
+            # Parse election date
+            try:
+                if election_day:
+                    election_date = datetime.strptime(election_day, '%Y-%m-%d').date()
+                else:
+                    election_date = None
+            except (ValueError, TypeError):
+                election_date = None
+            
+            # Filter by date if specified
+            if filter_past and election_date and election_date < today:
+                continue  # Skip past elections
+            
+            if max_months_ahead and election_date:
+                months_ahead = (election_date.year - today.year) * 12 + (election_date.month - today.month)
+                if months_ahead > max_months_ahead:
+                    continue  # Skip races too far in the future
+            
             for race in election_data.get('races', []):
                 position = race.get('position', {})
                 race_name = position.get('name', '')
@@ -1179,6 +1359,11 @@ def get_civic_engine_races():
                     # Classify election type
                     election_type = classify_election_type(race_name, race_level)
                     
+                    # Calculate days until election for prioritization
+                    days_until = None
+                    if election_date:
+                        days_until = (election_date - today).days
+                    
                     races.append({
                         'name': race_name,
                         'level': race_level,
@@ -1186,7 +1371,9 @@ def get_civic_engine_races():
                         'election_name': election_data.get('name', ''),
                         'race_id': race.get('id', ''),
                         'election_type': election_type,
-                        'election_type_desc': get_election_type_description(election_type)
+                        'election_type_desc': get_election_type_description(election_type),
+                        'days_until': days_until,
+                        'election_date': election_date.isoformat() if election_date else None
                     })
         
         print(f"Fetched {len(races)} state/federal races from Civic Engine API")
@@ -1200,7 +1387,8 @@ def get_civic_engine_races():
 # MAIN PROCESSING PIPELINE
 # ============================================================================
 
-def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None):
+def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None,
+                  max_months_ahead: Optional[int] = 18, filter_past: bool = True):
     """
     Main function to process all races and generate a ranked list.
     
@@ -1208,6 +1396,8 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
         max_races: Maximum number of races to process (None for all)
         verbose: Whether to print progress during processing
         nanda_year: Year to use for NANDA data (uses most recent if None)
+        max_months_ahead: Maximum months into the future to include races (default: 18)
+        filter_past: Whether to filter out past elections (default: True)
     """
     # Load NANDA data once for all races
     if verbose:
@@ -1216,8 +1406,8 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
     if verbose:
         print(f"Loaded NANDA data: {len(nanda_data)} FIPS codes")
     
-    # Get races from Civic Engine API
-    races = get_civic_engine_races()
+    # Get races from Civic Engine API (with date filtering)
+    races = get_civic_engine_races(max_months_ahead=max_months_ahead, filter_past=filter_past)
     
     if not races:
         print("No races found. Cannot generate recommendations.")
@@ -1356,10 +1546,14 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                         except (ValueError, AttributeError):
                             cycle = 2024
                         
-                        scores['sat_score'] = calculate_saturation_fec(race_name, cycle=cycle, verbose=verbose)
+                        sat_score, sat_metadata = calculate_saturation_fec(race_name, cycle=cycle, verbose=verbose)
+                        scores['sat_score'] = sat_score
                         scores['source'] += " + FEC"
-                        scores['sat_data_quality'] = 'high'  # FEC data is reliable
+                        scores['sat_data_quality'] = sat_metadata.get('data_quality', 'high')
+                        scores['sat_warnings'] = sat_metadata.get('warnings', [])
                         scores['fec_cycle'] = cycle  # Store cycle for reference
+                        if sat_metadata.get('error'):
+                            scores['sat_warnings'].append(f"FEC API error: {sat_metadata['error']}")
                         if verbose:
                             print(f"  FEC: Using cycle {cycle} for election year {election_year}")
                     else:
@@ -1486,10 +1680,14 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                 except (ValueError, AttributeError):
                     cycle = 2024
                 
-                scores['sat_score'] = calculate_saturation_fec(race_name, cycle=cycle, verbose=verbose)
+                sat_score, sat_metadata = calculate_saturation_fec(race_name, cycle=cycle, verbose=verbose)
+                scores['sat_score'] = sat_score
                 scores['source'] += " + FEC"
-                scores['sat_data_quality'] = 'high'  # FEC data is reliable
+                scores['sat_data_quality'] = sat_metadata.get('data_quality', 'high')
+                scores['sat_warnings'] = sat_metadata.get('warnings', [])
                 scores['fec_cycle'] = cycle  # Store cycle for reference
+                if sat_metadata.get('error'):
+                    scores['sat_warnings'].append(f"FEC API error: {sat_metadata['error']}")
                 if verbose:
                     print(f"  FEC: Using cycle {cycle} for election year {election_year}")
             else:
@@ -1534,6 +1732,29 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
         scores.setdefault('comp_warnings', [])
         scores.setdefault('sat_warnings', [])
         
+        # Add days until election for prioritization
+        if race.get('days_until') is not None:
+            days_until = race['days_until']
+            # Adjust leverage score based on time until election (sooner = slightly higher weight)
+            # Races within 90 days get 10% boost, races within 180 days get 5% boost
+            if days_until >= 0:
+                if days_until <= 90:
+                    scores['leverage_score'] *= 1.1  # 10% boost for upcoming races
+                    scores['time_priority'] = 'immediate'
+                elif days_until <= 180:
+                    scores['leverage_score'] *= 1.05  # 5% boost for near-term races
+                    scores['time_priority'] = 'near-term'
+                elif days_until > 730:  # More than 2 years away
+                    scores['time_priority'] = 'long-term'
+                    # Flag as low confidence due to distant date
+                    if 'comp_warnings' not in scores:
+                        scores['comp_warnings'] = []
+                    scores['comp_warnings'].append(f"Election is {days_until} days away - data may be incomplete")
+                    if scores.get('comp_data_quality') == 'high':
+                        scores['comp_data_quality'] = 'low'
+                else:
+                    scores['time_priority'] = 'medium-term'
+        
         recommendations.append(scores)
 
     # --- RANK AND PRINT FINAL LIST ---
@@ -1549,6 +1770,22 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
         print(f"\n#{i}: {r['name']} ({r['level']})")
         print(f"  Type: {r.get('election_type', 'Unknown')}")
         print(f"  Election Day: {r.get('day', 'N/A')}")
+        
+        # Show time until election if available
+        if r.get('days_until') is not None:
+            days_until = r['days_until']
+            if days_until < 0:
+                print(f"  ⚠️  Election Date: {days_until} days ago (past election)")
+            elif days_until <= 90:
+                print(f"  🚨 Election in {days_until} days (IMMEDIATE)")
+            elif days_until <= 180:
+                print(f"  ⏰ Election in {days_until} days (NEAR-TERM)")
+            elif days_until <= 365:
+                print(f"  📅 Election in {days_until} days")
+            else:
+                months_away = days_until // 30
+                print(f"  📅 Election in ~{months_away} months ({days_until} days)")
+        
         print(f"  Leverage Score: {r['leverage_score']:.3f}")
         print(f"  Data Sources: {r['source']}")
         print(f"    > Competitiveness: {r['comp_score']:.3f} (quality: {r.get('comp_data_quality', 'unknown')})")
@@ -1585,8 +1822,10 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
             
             if validation_warnings:
                 print(f"    📋 Market Validation Details:")
-                for warning in validation_warnings:
+                for warning in validation_warnings[:3]:  # Limit to first 3
                     print(f"       - {warning}")
+                if len(validation_warnings) > 3:
+                    print(f"       ... and {len(validation_warnings) - 3} more")
         
         # Show FEC cycle info if available
         if r.get('fec_cycle'):
@@ -1601,8 +1840,10 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
         
         if all_warnings:
             print(f"    ⚠️  Warnings:")
-            for warning in all_warnings:
+            for warning in all_warnings[:5]:  # Limit to first 5 warnings
                 print(f"       - {warning}")
+            if len(all_warnings) > 5:
+                print(f"       ... and {len(all_warnings) - 5} more warnings")
     
     if len(ranked_list) > top_n:
         print(f"\n... and {len(ranked_list) - top_n} more races")
