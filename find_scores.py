@@ -174,46 +174,17 @@ def _parse_ratio(value: str) -> Optional[float]:
         return None
 
 
-def extract_fips_from_race(race_name: str, state_abbrev: Optional[str] = None) -> List[str]:
-    """
-    Extract potential FIPS codes for a race.
-    
-    For House districts, this is complex as districts span multiple counties.
-    For now, we'll return state-level FIPS (state code + 000 for all counties in state).
-    For Senate races, we can use state-level data.
-    
-    Args:
-        race_name: Name of the race
-        state_abbrev: State abbreviation (2-letter code)
-    
-    Returns:
-        List of FIPS codes (can be multiple for House districts)
-    """
-    if not state_abbrev:
-        state_abbrev = extract_state_from_race_name(race_name)
-    
-    if not state_abbrev:
-        return []
-    
-    # State FIPS codes (first 2 digits)
-    state_fips_map = {
-        'AL': '01', 'AK': '02', 'AZ': '04', 'AR': '05', 'CA': '06', 'CO': '08', 'CT': '09',
-        'DE': '10', 'FL': '12', 'GA': '13', 'HI': '15', 'ID': '16', 'IL': '17', 'IN': '18',
-        'IA': '19', 'KS': '20', 'KY': '21', 'LA': '22', 'ME': '23', 'MD': '24', 'MA': '25',
-        'MI': '26', 'MN': '27', 'MS': '28', 'MO': '29', 'MT': '30', 'NE': '31', 'NV': '32',
-        'NH': '33', 'NJ': '34', 'NM': '35', 'NY': '36', 'NC': '37', 'ND': '38', 'OH': '39',
-        'OK': '40', 'OR': '41', 'PA': '42', 'RI': '44', 'SC': '45', 'SD': '46', 'TN': '47',
-        'TX': '48', 'UT': '49', 'VT': '50', 'VA': '51', 'WA': '53', 'WV': '54', 'WI': '55',
-        'WY': '56', 'DC': '11'
-    }
-    
-    state_fips = state_fips_map.get(state_abbrev)
-    if not state_fips:
-        return []
-    
-    # For now, return empty list - we'll need to aggregate by state
-    # In a full implementation, we'd map districts to counties
-    return [state_fips]
+# State FIPS codes mapping (shared constant)
+STATE_FIPS_MAP = {
+    'AL': '01', 'AK': '02', 'AZ': '04', 'AR': '05', 'CA': '06', 'CO': '08', 'CT': '09',
+    'DE': '10', 'FL': '12', 'GA': '13', 'HI': '15', 'ID': '16', 'IL': '17', 'IN': '18',
+    'IA': '19', 'KS': '20', 'KY': '21', 'LA': '22', 'ME': '23', 'MD': '24', 'MA': '25',
+    'MI': '26', 'MN': '27', 'MS': '28', 'MO': '29', 'MT': '30', 'NE': '31', 'NV': '32',
+    'NH': '33', 'NJ': '34', 'NM': '35', 'NY': '36', 'NC': '37', 'ND': '38', 'OH': '39',
+    'OK': '40', 'OR': '41', 'PA': '42', 'RI': '44', 'SC': '45', 'SD': '46', 'TN': '47',
+    'TX': '48', 'UT': '49', 'VT': '50', 'VA': '51', 'WA': '53', 'WV': '54', 'WI': '55',
+    'WY': '56', 'DC': '11'
+}
 
 
 def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType, 
@@ -233,25 +204,16 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
     Returns:
         Competitiveness score between 0 and 1 (higher = more competitive)
     """
-    state_abbrev = extract_state_from_race_name(race_name)
+    # Extract state from race name using parse_race_name
+    race_info = parse_race_name(race_name)
+    state_abbrev = race_info.get('state')
     if not state_abbrev:
         if verbose:
             print(f"  NANDA: Could not extract state from race name: {race_name}")
         return 0.5  # Default moderate competitiveness
     
     # Get state FIPS code
-    state_fips_map = {
-        'AL': '01', 'AK': '02', 'AZ': '04', 'AR': '05', 'CA': '06', 'CO': '08', 'CT': '09',
-        'DE': '10', 'FL': '12', 'GA': '13', 'HI': '15', 'ID': '16', 'IL': '17', 'IN': '18',
-        'IA': '19', 'KS': '20', 'KY': '21', 'LA': '22', 'ME': '23', 'MD': '24', 'MA': '25',
-        'MI': '26', 'MN': '27', 'MS': '28', 'MO': '29', 'MT': '30', 'NE': '31', 'NV': '32',
-        'NH': '33', 'NJ': '34', 'NM': '35', 'NY': '36', 'NC': '37', 'ND': '38', 'OH': '39',
-        'OK': '40', 'OR': '41', 'PA': '42', 'RI': '44', 'SC': '45', 'SD': '46', 'TN': '47',
-        'TX': '48', 'UT': '49', 'VT': '50', 'VA': '51', 'WA': '53', 'WV': '54', 'WI': '55',
-        'WY': '56', 'DC': '11'
-    }
-    
-    state_fips_prefix = state_fips_map.get(state_abbrev)
+    state_fips_prefix = STATE_FIPS_MAP.get(state_abbrev)
     if not state_fips_prefix:
         if verbose:
             print(f"  NANDA: Could not find FIPS code for state: {state_abbrev}")
@@ -479,119 +441,8 @@ def get_candidate_party_from_fec(candidate_name: str, bioguide_id: Optional[str]
         return None
 
 
-def get_current_officeholder_winner(race_name: str, verbose: bool = False) -> Optional[Dict[str, Any]]:
-    """
-    Get the current office holder for a House race, who represents the most recent winner.
-    
-    This is a practical approach given API limitations - we identify who currently holds
-    the office, which indicates they won the most recent election.
-    
-    Args:
-        race_name: Name of the race
-        verbose: Whether to print debug info
-    
-    Returns:
-        Dictionary with winner info (name, party, bioguide_id) or None
-    """
-    race_info = parse_race_name(race_name)
-    if not race_info['office'] or not race_info['state'] or not race_info.get('district'):
-        return None
-    
-    state = race_info['state']
-    district = race_info['district']
-    
-    # Query OfficeHolders
-    query = '''
-    query GetOfficeHolders($first: Int!) {
-      officeHolders(first: $first) {
-        nodes {
-          id
-          person {
-            id
-            fullName
-            bioguideId
-          }
-          position {
-            id
-            name
-            level
-          }
-        }
-      }
-    }
-    '''
-    
-    try:
-        result = query_civicengine(query, {'first': 500}, CIVIC_ENGINE_TOKEN)
-        if 'errors' in result:
-            return None
-        
-        office_holders = result.get('data', {}).get('officeHolders', {}).get('nodes', [])
-        
-        # State name mapping
-        state_names = {
-            'AL': 'Alabama', 'AK': 'Alaska', 'AZ': 'Arizona', 'AR': 'Arkansas',
-            'CA': 'California', 'CO': 'Colorado', 'CT': 'Connecticut', 'DE': 'Delaware',
-            'FL': 'Florida', 'GA': 'Georgia', 'HI': 'Hawaii', 'ID': 'Idaho',
-            'IL': 'Illinois', 'IN': 'Indiana', 'IA': 'Iowa', 'KS': 'Kansas',
-            'KY': 'Kentucky', 'LA': 'Louisiana', 'ME': 'Maine', 'MD': 'Maryland',
-            'MA': 'Massachusetts', 'MI': 'Michigan', 'MN': 'Minnesota', 'MS': 'Mississippi',
-            'MO': 'Missouri', 'MT': 'Montana', 'NE': 'Nebraska', 'NV': 'Nevada',
-            'NH': 'New Hampshire', 'NJ': 'New Jersey', 'NM': 'New Mexico', 'NY': 'New York',
-            'NC': 'North Carolina', 'ND': 'North Dakota', 'OH': 'Ohio', 'OK': 'Oklahoma',
-            'OR': 'Oregon', 'PA': 'Pennsylvania', 'RI': 'Rhode Island', 'SC': 'South Carolina',
-            'SD': 'South Dakota', 'TN': 'Tennessee', 'TX': 'Texas', 'UT': 'Utah',
-            'VT': 'Vermont', 'VA': 'Virginia', 'WA': 'Washington', 'WV': 'West Virginia',
-            'WI': 'Wisconsin', 'WY': 'Wyoming', 'DC': 'District of Columbia'
-        }
-        state_name = state_names.get(state, '')
-        
-        # Find matching office holder
-        for oh in office_holders:
-            position = oh.get('position', {})
-            pos_name = position.get('name', '')
-            pos_level = position.get('level', '')
-            
-            if pos_level != 'FEDERAL' or 'House of Representatives' not in pos_name:
-                continue
-            
-            # Check state match
-            if state not in pos_name and state_name not in pos_name:
-                continue
-            
-            # Check district match
-            district_str = str(district)
-            ordinal_suffixes = {1: 'st', 2: 'nd', 3: 'rd', 11: 'th', 12: 'th', 13: 'th'}
-            suffix = ordinal_suffixes.get(district % 100, 'th')
-            if district % 100 not in [11, 12, 13]:
-                suffix = ordinal_suffixes.get(district % 10, 'th')
-            
-            district_patterns = [
-                f" {district}{suffix} Congressional",
-                f"District {district}",
-                f" {district} ",
-            ]
-            
-            if any(pattern in pos_name for pattern in district_patterns):
-                person = oh.get('person', {})
-                name = person.get('fullName', '')
-                bioguide_id = person.get('bioguideId')
-                
-                # Get party from FEC
-                party = get_candidate_party_from_fec(
-                    name, bioguide_id, state, district,
-                    cycle=2024, verbose=False
-                )
-                
-                return {
-                    'name': name,
-                    'bioguide_id': bioguide_id,
-                    'party': party,
-                }
-        
-        return None
-    except Exception:
-        return None
+# Note: get_current_officeholder_winner was removed - we now use get_historical_winners_civicengine
+# which directly queries ElectionResult from Civic Engine for more accurate historical data
 
 
 def calculate_competitiveness_from_historical(race_name: str, race_type: ElectionType,
@@ -599,22 +450,8 @@ def calculate_competitiveness_from_historical(race_name: str, race_type: Electio
     """
     Calculate competitiveness score from historical election results.
     
-    APPROACH: Uses current office holder (most recent winner) to determine party.
-    Since comprehensive historical election data with vote counts is not available
-    from Civic Engine or FEC APIs, we use a practical approach:
-    - Get current office holder (represents most recent winner)
-    - Map to party using FEC API
-    - For competitiveness, this gives us one data point (current party in power)
-    
-    LIMITATIONS:
-    - Only provides most recent winner, not historical trends
-    - OfficeHolder data may be incomplete in Civic Engine
-    - No vote margins or multiple election cycles available
-    
-    Future improvements: Could integrate external data sources like:
-    - MIT Election Data and Science Lab
-    - AP Election Data
-    - Manual database of historical results
+    Uses Civic Engine's ElectionResult field to get historical winners from past elections.
+    Calculates competitiveness based on party consistency across multiple election cycles.
     
     Args:
         race_name: Name of the race
@@ -629,15 +466,12 @@ def calculate_competitiveness_from_historical(race_name: str, race_type: Electio
     metadata = {
         "data_quality": "low",
         "historical_elections_found": 0,
-        "method": "fec_historical",
+        "method": "civicengine_historical",
         "warnings": [],
         "historical_winners": []
     }
     
-    # Historical data should work for all race types
-    # Try to get historical data regardless of race type
-    
-    # Get historical election results from FEC
+    # Get historical election results from Civic Engine
     historical_results = get_historical_election_results(race_name, years_back=6, verbose=verbose)
     
     if not historical_results:
@@ -1034,6 +868,23 @@ def calculate_competitiveness_primary(markets):
 # FEC API INTEGRATION
 # ============================================================================
 
+# State name to abbreviation mapping (shared constant)
+STATE_NAME_TO_ABBREV = {
+    'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR',
+    'California': 'CA', 'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE',
+    'Florida': 'FL', 'Georgia': 'GA', 'Hawaii': 'HI', 'Idaho': 'ID',
+    'Illinois': 'IL', 'Indiana': 'IN', 'Iowa': 'IA', 'Kansas': 'KS',
+    'Kentucky': 'KY', 'Louisiana': 'LA', 'Maine': 'ME', 'Maryland': 'MD',
+    'Massachusetts': 'MA', 'Michigan': 'MI', 'Minnesota': 'MN', 'Mississippi': 'MS',
+    'Missouri': 'MO', 'Montana': 'MT', 'Nebraska': 'NE', 'Nevada': 'NV',
+    'New Hampshire': 'NH', 'New Jersey': 'NJ', 'New Mexico': 'NM', 'New York': 'NY',
+    'North Carolina': 'NC', 'North Dakota': 'ND', 'Ohio': 'OH', 'Oklahoma': 'OK',
+    'Oregon': 'OR', 'Pennsylvania': 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC',
+    'South Dakota': 'SD', 'Tennessee': 'TN', 'Texas': 'TX', 'Utah': 'UT',
+    'Vermont': 'VT', 'Virginia': 'VA', 'Washington': 'WA', 'West Virginia': 'WV',
+    'Wisconsin': 'WI', 'Wyoming': 'WY', 'District of Columbia': 'DC'
+}
+
 def parse_race_name(race_name):
     """
     Parse a race name to extract office type, state, and district.
@@ -1041,42 +892,21 @@ def parse_race_name(race_name):
     Returns:
         dict with keys: 'office' ('S' or 'H'), 'state' (2-letter code), 'district' (int or None)
     """
-    # State abbreviations mapping
-    state_abbrev = {
-        'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR',
-        'California': 'CA', 'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE',
-        'Florida': 'FL', 'Georgia': 'GA', 'Hawaii': 'HI', 'Idaho': 'ID',
-        'Illinois': 'IL', 'Indiana': 'IN', 'Iowa': 'IA', 'Kansas': 'KS',
-        'Kentucky': 'KY', 'Louisiana': 'LA', 'Maine': 'ME', 'Maryland': 'MD',
-        'Massachusetts': 'MA', 'Michigan': 'MI', 'Minnesota': 'MN', 'Mississippi': 'MS',
-        'Missouri': 'MO', 'Montana': 'MT', 'Nebraska': 'NE', 'Nevada': 'NV',
-        'New Hampshire': 'NH', 'New Jersey': 'NJ', 'New Mexico': 'NM', 'New York': 'NY',
-        'North Carolina': 'NC', 'North Dakota': 'ND', 'Ohio': 'OH', 'Oklahoma': 'OK',
-        'Oregon': 'OR', 'Pennsylvania': 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC',
-        'South Dakota': 'SD', 'Tennessee': 'TN', 'Texas': 'TX', 'Utah': 'UT',
-        'Vermont': 'VT', 'Virginia': 'VA', 'Washington': 'WA', 'West Virginia': 'WV',
-        'Wisconsin': 'WI', 'Wyoming': 'WY', 'District of Columbia': 'DC'
-    }
-    
     result = {'office': None, 'state': None, 'district': None}
     
+    # Extract state name (works for all race types)
+    for state_name, abbrev in STATE_NAME_TO_ABBREV.items():
+        if state_name in race_name:
+            result['state'] = abbrev
+            break
+    
     # Check for Senate race
-    if 'U.S. Senate' in race_name or 'Senate' in race_name:
+    if 'U.S. Senate' in race_name or ('Senate' in race_name and 'U.S.' in race_name):
         result['office'] = 'S'
-        # Extract state name
-        for state_name, abbrev in state_abbrev.items():
-            if state_name in race_name:
-                result['state'] = abbrev
-                break
     
     # Check for House race
-    elif 'U.S. House' in race_name or 'House of Representatives' in race_name:
+    elif 'U.S. House' in race_name or ('House of Representatives' in race_name and 'U.S.' in race_name):
         result['office'] = 'H'
-        # Extract state name
-        for state_name, abbrev in state_abbrev.items():
-            if state_name in race_name:
-                result['state'] = abbrev
-                break
         
         # Extract district number
         district_match = re.search(r'(\d+)(?:st|nd|rd|th)?\s+Congressional District', race_name)
