@@ -20,6 +20,7 @@ import math
 import re
 import csv
 import os
+import time
 from collections import defaultdict
 from get_civicengine import get_current_state_federal_elections, query_civicengine
 from credentials import FEC_TOKEN, CIVIC_ENGINE_TOKEN
@@ -1042,7 +1043,6 @@ def get_fec_candidates_total_receipts(office: str, state: str, district: Optiona
                         wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
                         if verbose:
                             print(f"  FEC: Rate limited (cycle {check_cycle}), waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
-                        import time
                         time.sleep(wait_time)
                         continue
                     else:
@@ -1082,7 +1082,6 @@ def get_fec_candidates_total_receipts(office: str, state: str, district: Optiona
                                 if totals_response.status_code == 429:
                                     if totals_attempt < max_retries - 1:
                                         wait_time = retry_delay * (2 ** totals_attempt)
-                                        import time
                                         time.sleep(wait_time)
                                         continue
                                     else:
@@ -1100,7 +1099,6 @@ def get_fec_candidates_total_receipts(office: str, state: str, district: Optiona
                                 if totals_attempt < max_retries - 1:
                                     # Retry with exponential backoff
                                     wait_time = retry_delay * (2 ** totals_attempt)
-                                    import time
                                     time.sleep(wait_time)
                                 else:
                                     # Last attempt failed, skip this cycle
@@ -1122,7 +1120,6 @@ def get_fec_candidates_total_receipts(office: str, state: str, district: Optiona
                     wait_time = retry_delay * (2 ** attempt)
                     if verbose:
                         print(f"  FEC: Request error for cycle {check_cycle} (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}")
-                    import time
                     time.sleep(wait_time)
                 else:
                     # Last attempt failed
@@ -1308,7 +1305,7 @@ def calculate_saturation_kalshi(volume, spread, verbose: bool = False) -> Tuple[
 # CIVIC ENGINE API INTEGRATION
 # ============================================================================
 
-def get_civic_engine_races(max_months_ahead: Optional[int] = 18, filter_past: bool = True):
+def get_civic_engine_races(max_months_ahead: Optional[int] = 18, filter_past: bool = True, max_retries: int = 3):
     """
     Fetches current state and federal elections from Civic Engine API
     and returns a list of individual races with classification.
@@ -1317,71 +1314,82 @@ def get_civic_engine_races(max_months_ahead: Optional[int] = 18, filter_past: bo
         max_months_ahead: Maximum months into the future to include races (default: 18)
                          None = no limit
         filter_past: Whether to filter out past elections (default: True)
+        max_retries: Maximum number of retry attempts for API failures (default: 3)
     
     Returns:
         List of race dictionaries with classification and metadata
     """
-    try:
-        # Get elections from Civic Engine API (verbose=False to reduce output)
-        elections_dict = get_current_state_federal_elections(max_elections=100, verbose=False)
-        
-        # Extract individual races from elections
-        races = []
-        today = datetime.now().date()
-        
-        for election_id, election_data in elections_dict.items():
-            election_day = election_data.get('electionDay', '')
+    retry_delay = 1  # Start with 1 second
+    
+    for attempt in range(max_retries):
+        try:
+            # Get elections from Civic Engine API (verbose=False to reduce output)
+            elections_dict = get_current_state_federal_elections(max_elections=100, verbose=False)
             
-            # Parse election date
-            try:
-                if election_day:
-                    election_date = datetime.strptime(election_day, '%Y-%m-%d').date()
-                else:
-                    election_date = None
-            except (ValueError, TypeError):
-                election_date = None
+            # Extract individual races from elections
+            races = []
+            today = datetime.now().date()
             
-            # Filter by date if specified
-            if filter_past and election_date and election_date < today:
-                continue  # Skip past elections
-            
-            if max_months_ahead and election_date:
-                months_ahead = (election_date.year - today.year) * 12 + (election_date.month - today.month)
-                if months_ahead > max_months_ahead:
-                    continue  # Skip races too far in the future
-            
-            for race in election_data.get('races', []):
-                position = race.get('position', {})
-                race_name = position.get('name', '')
-                race_level = position.get('level', '')
+            for election_id, election_data in elections_dict.items():
+                election_day = election_data.get('electionDay', '')
                 
-                if race_name and race_level in ['STATE', 'FEDERAL']:
-                    # Classify election type
-                    election_type = classify_election_type(race_name, race_level)
+                # Parse election date
+                try:
+                    if election_day:
+                        election_date = datetime.strptime(election_day, '%Y-%m-%d').date()
+                    else:
+                        election_date = None
+                except (ValueError, TypeError):
+                    election_date = None
+                
+                # Filter by date if specified
+                if filter_past and election_date and election_date < today:
+                    continue  # Skip past elections
+                
+                if max_months_ahead and election_date:
+                    months_ahead = (election_date.year - today.year) * 12 + (election_date.month - today.month)
+                    if months_ahead > max_months_ahead:
+                        continue  # Skip races too far in the future
+                
+                for race in election_data.get('races', []):
+                    position = race.get('position', {})
+                    race_name = position.get('name', '')
+                    race_level = position.get('level', '')
                     
-                    # Calculate days until election for prioritization
-                    days_until = None
-                    if election_date:
-                        days_until = (election_date - today).days
-                    
-                    races.append({
-                        'name': race_name,
-                        'level': race_level,
-                        'day': election_day,
-                        'election_name': election_data.get('name', ''),
-                        'race_id': race.get('id', ''),
-                        'election_type': election_type,
-                        'election_type_desc': get_election_type_description(election_type),
-                        'days_until': days_until,
-                        'election_date': election_date.isoformat() if election_date else None
-                    })
-        
-        print(f"Fetched {len(races)} state/federal races from Civic Engine API")
-        return races
-    except Exception as e:
-        print(f"Error fetching data from Civic Engine API: {e}")
-        print("Falling back to empty list")
-        return []
+                    if race_name and race_level in ['STATE', 'FEDERAL']:
+                        # Classify election type
+                        election_type = classify_election_type(race_name, race_level)
+                        
+                        # Calculate days until election for prioritization
+                        days_until = None
+                        if election_date:
+                            days_until = (election_date - today).days
+                        
+                        races.append({
+                            'name': race_name,
+                            'level': race_level,
+                            'day': election_day,
+                            'election_name': election_data.get('name', ''),
+                            'race_id': race.get('id', ''),
+                            'election_type': election_type,
+                            'election_type_desc': get_election_type_description(election_type),
+                            'days_until': days_until,
+                            'election_date': election_date.isoformat() if election_date else None
+                        })
+            
+            print(f"Fetched {len(races)} state/federal races from Civic Engine API")
+            return races
+        except Exception as e:
+            if attempt < max_retries - 1:
+                # Retry with exponential backoff
+                wait_time = retry_delay * (2 ** attempt)
+                print(f"Error fetching data from Civic Engine API (attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"Error fetching data from Civic Engine API after {max_retries} attempts: {e}")
+                print("Falling back to empty list")
+                return []
 
 # ============================================================================
 # MAIN PROCESSING PIPELINE
@@ -1441,10 +1449,13 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
             'level': race_level,
             'day': election_day,
             'election_type': election_type_desc,
+            'election_type_desc': election_type_desc,  # Also store for consistency
             'source': '',
             'comp_score': 0,
             'sat_score': 0,
-            'leverage_score': 0
+            'leverage_score': 0,
+            'days_until': race.get('days_until'),  # Copy days_until from race
+            'election_date': race.get('election_date')  # Copy election_date from race
         }
         
         # Determine election year for data matching
@@ -1732,9 +1743,9 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
         scores.setdefault('comp_warnings', [])
         scores.setdefault('sat_warnings', [])
         
-        # Add days until election for prioritization
-        if race.get('days_until') is not None:
-            days_until = race['days_until']
+        # Add days until election for prioritization (use from scores dict which was copied from race)
+        days_until = scores.get('days_until')
+        if days_until is not None:
             # Adjust leverage score based on time until election (sooner = slightly higher weight)
             # Races within 90 days get 10% boost, races within 180 days get 5% boost
             if days_until >= 0:
@@ -1768,7 +1779,7 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
     top_n = min(20, len(ranked_list))
     for i, r in enumerate(ranked_list[:top_n], 1):
         print(f"\n#{i}: {r['name']} ({r['level']})")
-        print(f"  Type: {r.get('election_type', 'Unknown')}")
+        print(f"  Type: {r.get('election_type_desc', r.get('election_type', 'Unknown'))}")
         print(f"  Election Day: {r.get('day', 'N/A')}")
         
         # Show time until election if available
