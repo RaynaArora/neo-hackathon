@@ -1,6 +1,11 @@
 # Credentials
 credentials.py
 
+# Notes
+ANALYSIS.md
+CIVIC_ENGINE_HISTORICAL_IMPLEMENTATION.md
+ISSUES_STATUS.md
+
 # Python
 __pycache__/
 *.py[cod]
