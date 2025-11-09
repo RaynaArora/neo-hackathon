@@ -273,15 +273,20 @@ STATE_FIPS_MAP = {
 def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType, 
                                     nanda_data: Dict[str, List[Dict[str, Any]]],
                                     year: Optional[int] = None,
+                                    race_level: Optional[str] = None,
                                     verbose: bool = False) -> float:
     """
     Calculate competitiveness score using NANDA party split data.
+    
+    For county races, attempts to use county-specific data if county name can be extracted.
+    For state/federal races, aggregates all counties in the state.
     
     Args:
         race_name: Name of the race
         race_type: Type of election
         nanda_data: NANDA data organized by FIPS code
         year: Election year (uses most recent data if not specified)
+        race_level: Level of race (FEDERAL, STATE, COUNTY, etc.) - helps determine aggregation
         verbose: Whether to print debug information
     
     Returns:
@@ -302,9 +307,6 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
             print(f"  NANDA: Could not find FIPS code for state: {state_abbrev}")
         return 0.5
     
-    # Aggregate data for all counties in the state
-    state_ratios = []
-    
     # Determine which ratio field to use based on race type
     ratio_field = None
     if race_type == ElectionType.US_SENATE or race_type == ElectionType.STATE_SENATE:
@@ -314,9 +316,29 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
     else:
         ratio_field = 'pres_dem_ratio'  # Default to presidential
     
-    # Collect ratios from all counties in the state
+    # For county races, try to find county-specific data
+    # TODO: Implement county name extraction and FIPS matching for county-specific data
+    # For now, we still aggregate at state level, but this is a known limitation
+    use_county_specific = False
+    county_fips = None
+    
+    # Check if this is a county race and try to extract county name
+    if race_level and race_level not in ['FEDERAL', 'STATE']:
+        # Could be county race - try to extract county name from race name
+        # This is a future improvement - would need county name → FIPS mapping
+        if verbose:
+            print(f"  NANDA: County race detected, but county-specific matching not yet implemented (using state aggregation)")
+    
+    # Collect ratios from counties in the state
+    # If county-specific FIPS found, use only that county; otherwise aggregate all counties
+    state_ratios = []
+    
     for fips, records in nanda_data.items():
         if fips.startswith(state_fips_prefix):
+            # If we have county-specific FIPS, only use that county
+            if county_fips and fips != county_fips:
+                continue
+            
             for record in records:
                 if year is None or record['year'] == year:
                     ratio = record.get(ratio_field)
@@ -325,10 +347,13 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
     
     if not state_ratios:
         if verbose:
-            print(f"  NANDA: No data found for {state_abbrev} ({state_fips_prefix}*)")
+            if county_fips:
+                print(f"  NANDA: No data found for county {county_fips}")
+            else:
+                print(f"  NANDA: No data found for {state_abbrev} ({state_fips_prefix}*)")
         return 0.5  # Default moderate competitiveness
     
-    # Calculate average party split for the state
+    # Calculate average party split
     avg_dem_ratio = sum(state_ratios) / len(state_ratios)
     avg_rep_ratio = 1.0 - avg_dem_ratio
     
@@ -339,8 +364,12 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
     competitiveness = max(0.0, min(1.0, competitiveness))
     
     if verbose:
-        print(f"  NANDA: State {state_abbrev}: Dem {avg_dem_ratio:.1%}, Rep {avg_rep_ratio:.1%}")
-        print(f"  NANDA: Competitiveness score: {competitiveness:.3f} (based on {len(state_ratios)} counties)")
+        if county_fips:
+            print(f"  NANDA: County {county_fips}: Dem {avg_dem_ratio:.1%}, Rep {avg_rep_ratio:.1%}")
+            print(f"  NANDA: Competitiveness score: {competitiveness:.3f} (county-specific)")
+        else:
+            print(f"  NANDA: State {state_abbrev}: Dem {avg_dem_ratio:.1%}, Rep {avg_rep_ratio:.1%}")
+            print(f"  NANDA: Competitiveness score: {competitiveness:.3f} (based on {len(state_ratios)} counties, state-level aggregation)")
     
     return competitiveness
 
@@ -1567,24 +1596,30 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                 scores['comp_warnings'].extend(validation_info.get('warnings', []))
             
             if markets:
-                # 1. Calculate Competitiveness
+                # 1. Calculate Competitiveness from Kalshi
                 try:
                     # Get market volume for data quality assessment
                     market_volume = market_series.get('total_series_volume', 0) or 0
                     
+                    # Get match quality for weighting
+                    match_score = validation_info.get('match_score', 1.0) if validation_info else 1.0
+                    is_valid_match = validation_info.get('is_valid', True) if validation_info else True
+                    
+                    # Calculate base competitiveness from market
                     if len(markets) <= 2:  # Binary general election
                         market = markets[0]
                         price = market.get('last_price') or market.get('yes_bid', 50)
                         if price:
-                            scores['comp_score'] = calculate_competitiveness_general(price)
+                            kalshi_comp = calculate_competitiveness_general(price)
                             # Use spread from the main market
                             yes_ask = market.get('yes_ask', 0)
                             yes_bid = market.get('yes_bid', 0)
                             spread = max(1, yes_ask - yes_bid)
                         else:
+                            kalshi_comp = 0.5
                             spread = 1
                     else:  # Multi-candidate primary
-                        scores['comp_score'] = calculate_competitiveness_primary(markets)
+                        kalshi_comp = calculate_competitiveness_primary(markets)
                         # Get spread from the *leading* candidate
                         sorted_markets = sorted(
                             [m for m in markets if m.get('last_price')],
@@ -1599,11 +1634,19 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                         else:
                             spread = 1
                     
-                    # Set competitiveness data quality based on market volume
-                    if market_volume < 10:
+                    # Store Kalshi competitiveness (will be combined with other sources)
+                    scores['kalshi_comp'] = kalshi_comp
+                    scores['kalshi_comp_weight'] = match_score if is_valid_match else match_score * 0.5  # Downweight poor matches
+                    scores['kalshi_comp_available'] = True
+                    
+                    # Set competitiveness data quality based on market volume and match quality
+                    if market_volume < 10 or not is_valid_match:
                         scores['comp_data_quality'] = 'low'
-                        scores['comp_warnings'] = ['Low Kalshi market volume - competitiveness may be unreliable']
-                    elif market_volume < 100:
+                        if market_volume < 10:
+                            scores['comp_warnings'] = ['Low Kalshi market volume - competitiveness may be unreliable']
+                        if not is_valid_match:
+                            scores['comp_warnings'].append('Poor Kalshi market match - competitiveness downweighted')
+                    elif market_volume < 100 or match_score < 0.7:
                         scores['comp_data_quality'] = 'medium'
                     else:
                         scores['comp_data_quality'] = 'high'
@@ -1650,24 +1693,32 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                         if verbose:
                             print(f"  FEC: Using cycle {cycle} for election year {election_year}")
                     else:
-                        # State races: Use Kalshi proxy ONLY if a Kalshi market was found
-                        # Note: This proxy only works when a market exists (even if it's a poor match).
-                        # The proxy uses market volume and spread as indicators of campaign attention:
-                        # - Low volume + high spread = less attention = lower saturation = higher score
-                        # - High volume + low spread = more attention = higher saturation = lower score
-                        # If no market exists at all, saturation cannot be calculated (will be None).
-                        volume = market_series.get('total_series_volume', 0) or 0
-                        sat_score, sat_metadata = calculate_saturation_kalshi(volume, spread, verbose=verbose)
-                        scores['sat_score'] = sat_score
-                        scores['sat_data_quality'] = sat_metadata.get('data_quality', 'medium')
-                        scores['sat_warnings'] = sat_metadata.get('warnings', [])
-                        scores['sat_method'] = 'kalshi_proxy'  # Mark as proxy method
-                        scores['source'] += " + Kalshi (proxy: using market volume/spread as estimate)"
-                        if sat_metadata.get('warnings'):
-                            scores['sat_warnings'] = sat_metadata['warnings']
-                        # Add explanation to warnings if not already present
-                        if 'Kalshi market volume/spread used as proxy' not in str(scores['sat_warnings']):
-                            scores['sat_warnings'].insert(0, 'Kalshi market volume/spread used as proxy for campaign finance data (not actual fundraising data)')
+                        # State races: Use Kalshi proxy ONLY if a GOOD Kalshi market match was found
+                        # Poor matches are not reliable for saturation (wrong race = wrong market activity)
+                        match_score = validation_info.get('match_score', 1.0) if validation_info else 1.0
+                        is_valid_match = validation_info.get('is_valid', True) if validation_info else True
+                        
+                        if is_valid_match and match_score >= 0.6:
+                            # Good match - use Kalshi proxy
+                            volume = market_series.get('total_series_volume', 0) or 0
+                            sat_score, sat_metadata = calculate_saturation_kalshi(volume, spread, verbose=verbose)
+                            scores['sat_score'] = sat_score
+                            scores['sat_data_quality'] = sat_metadata.get('data_quality', 'medium')
+                            scores['sat_warnings'] = sat_metadata.get('warnings', [])
+                            scores['sat_method'] = 'kalshi_proxy'  # Mark as proxy method
+                            scores['source'] += " + Kalshi (proxy: using market volume/spread as estimate)"
+                            if sat_metadata.get('warnings'):
+                                scores['sat_warnings'] = sat_metadata['warnings']
+                            # Add explanation to warnings if not already present
+                            if 'Kalshi market volume/spread used as proxy' not in str(scores['sat_warnings']):
+                                scores['sat_warnings'].insert(0, 'Kalshi market volume/spread used as proxy for campaign finance data (not actual fundraising data)')
+                        else:
+                            # Poor match - don't use for saturation (set to None, will become 1.0)
+                            scores['sat_score'] = None
+                            scores['sat_data_quality'] = 'none'
+                            scores['sat_warnings'] = ['Poor Kalshi market match - saturation not calculated (using neutral value)']
+                            if verbose:
+                                print(f"  ⚠️  Poor Kalshi match (score: {match_score:.2f}) - not using for saturation")
                         
                     if verbose:
                         print(f"  ✓ Found Kalshi market: {len(markets)} markets, comp={scores['comp_score']:.3f}")
@@ -1681,79 +1732,112 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                     print(f"  ✗ Kalshi market found but no markets in series")
                 market_series = None
 
-        # --- TIER 2: FALLBACK (No Kalshi market found) ---
-        if not market_series or 'markets' not in market_series or not market_series.get('markets'):
-            scores['source'] = 'Civic Engine'
+        # --- COMBINE ALL COMPETITIVENESS SOURCES (Weighted Average) ---
+        # Collect all available competitiveness sources and combine them with weights
+        comp_sources = []
+        comp_weights = []
+        comp_source_names = []
+        
+        # 1. Kalshi (if available)
+        if scores.get('kalshi_comp_available', False):
+            kalshi_comp = scores.get('kalshi_comp', 0.5)
+            kalshi_weight = scores.get('kalshi_comp_weight', 0.5)
+            comp_sources.append(kalshi_comp)
+            comp_weights.append(kalshi_weight)
+            comp_source_names.append('Kalshi')
+            if verbose:
+                print(f"  Kalshi competitiveness: {kalshi_comp:.3f} (weight: {kalshi_weight:.2f})")
+        
+        # 2. Historical data (always try to get)
+        historical_comp = None
+        historical_weight = 0.0
+        try:
+            comp_score, comp_metadata = calculate_competitiveness_from_historical(
+                race_name, election_type, verbose=verbose
+            )
             
-            # 1. Calculate Competitiveness
-            # Try historical data first for all race types (more accurate than NANDA when available)
-            # Historical data works for any race type that has positions in Civic Engine
-            nanda_fallback = False
-            try:
-                comp_score, comp_metadata = calculate_competitiveness_from_historical(
-                    race_name, election_type, verbose=verbose
-                )
-                
-                # Only use historical data if we got actual results (not just default/fallback)
-                if comp_metadata.get('historical_elections_found', 0) > 0:
-                    scores['comp_score'] = comp_score
-                    scores['comp_data_quality'] = comp_metadata.get('data_quality', 'low')
-                    scores['comp_warnings'] = comp_metadata.get('warnings', [])
-                    scores['source'] += " + Historical"
-                    if verbose:
-                        print(f"  ✓ Using historical data for competitiveness: {scores['comp_score']:.3f}")
-                        if comp_metadata.get('warnings'):
-                            for warning in comp_metadata['warnings']:
-                                print(f"  ⚠️  {warning}")
-                    # Skip fallback to NANDA since we have historical data
-                    nanda_fallback = False
-                else:
-                    # No historical data found, fall back to NANDA
-                    nanda_fallback = True
-                    if verbose:
-                        print(f"  → No historical data available, falling back to NANDA")
-            except Exception as e:
+            if comp_metadata.get('historical_elections_found', 0) > 0:
+                historical_comp = comp_score
+                # Weight based on number of elections found
+                num_elections = comp_metadata.get('historical_elections_found', 0)
+                historical_weight = min(1.0, 0.3 + (num_elections - 1) * 0.2)  # 0.3 for 1 election, up to 1.0 for 4+
+                comp_sources.append(historical_comp)
+                comp_weights.append(historical_weight)
+                comp_source_names.append('Historical')
                 if verbose:
-                    print(f"  ✗ Error calculating historical competitiveness: {e}")
-                nanda_fallback = True
-            
-            # Fall back to NANDA if historical data wasn't available
-            if nanda_fallback:
-                if nanda_data:
-                    try:
-                        scores['comp_score'] = calculate_competitiveness_nanda(
-                            race_name, 
-                            election_type, 
-                            nanda_data, 
-                            year=election_year,
-                            verbose=verbose
-                        )
-                        scores['source'] += " + NANDA"
+                    print(f"  Historical competitiveness: {historical_comp:.3f} (weight: {historical_weight:.2f}, {num_elections} elections)")
+        except Exception as e:
+            if verbose:
+                print(f"  ✗ Error calculating historical competitiveness: {e}")
+        
+        # 3. NANDA data (always try to get)
+        nanda_comp = None
+        nanda_weight = 0.0
+        if nanda_data:
+            try:
+                nanda_comp = calculate_competitiveness_nanda(
+                    race_name, 
+                    election_type, 
+                    nanda_data, 
+                    year=election_year,
+                    race_level=race_level,
+                    verbose=verbose
+                )
+                # NANDA weight is lower (less accurate than Kalshi/historical)
+                # For county races, we could use county-specific data (future improvement)
+                nanda_weight = 0.2  # Lower weight for state-level aggregation
+                comp_sources.append(nanda_comp)
+                comp_weights.append(nanda_weight)
+                comp_source_names.append('NANDA')
+                if verbose:
+                    print(f"  NANDA competitiveness: {nanda_comp:.3f} (weight: {nanda_weight:.2f})")
+            except Exception as e2:
+                if verbose:
+                    print(f"  ✗ Error calculating NANDA competitiveness: {e2}")
+        
+        # Combine all available sources with weighted average
+        if comp_sources:
+            # Normalize weights so they sum to 1.0 (if some sources missing, others get more weight)
+            total_weight = sum(comp_weights)
+            if total_weight > 0:
+                normalized_weights = [w / total_weight for w in comp_weights]
+                final_comp = sum(comp * weight for comp, weight in zip(comp_sources, normalized_weights))
+                scores['comp_score'] = final_comp
+                scores['source'] = ' + '.join(comp_source_names)
+                
+                # Determine overall data quality
+                if len(comp_sources) >= 2:
+                    scores['comp_data_quality'] = 'high'
+                elif len(comp_sources) == 1:
+                    if comp_source_names[0] == 'Kalshi' and scores.get('kalshi_comp_weight', 0) >= 0.7:
+                        scores['comp_data_quality'] = 'high'
+                    elif comp_source_names[0] == 'Historical':
                         scores['comp_data_quality'] = 'medium'
-                        if not scores.get('comp_warnings'):
-                            scores['comp_warnings'] = []
-                        scores['comp_warnings'].append('Using state-level NANDA data (not district-specific)')
-                        if verbose:
-                            print(f"  ✓ Using NANDA for competitiveness: {scores['comp_score']:.3f}")
-                    except Exception as e2:
-                        if verbose:
-                            print(f"  ✗ Error calculating NANDA competitiveness: {e2}")
-                        scores['comp_score'] = 0.5
-                        scores['comp_data_quality'] = 'low'
-                        scores['comp_warnings'] = ['No competitiveness data available']
+                    else:
+                        scores['comp_data_quality'] = 'medium'
                 else:
-                    scores['comp_score'] = 0.5
                     scores['comp_data_quality'] = 'low'
-                    scores['comp_warnings'] = ['No competitiveness data available']
-                    if verbose:
-                        print(f"  → No NANDA data available, using default competitiveness")
-            
-            # 2. Calculate Saturation
-            # For races without Kalshi markets, saturation depends on race level:
-            # - Federal races: Always try FEC (even without Kalshi)
-            # - State races: Only have saturation if Kalshi market exists (already handled above if Kalshi found)
-            # - Local races (city council, county): No data sources available
-            
+                
+                if verbose:
+                    print(f"  ✓ Combined competitiveness: {final_comp:.3f} (sources: {', '.join(comp_source_names)})")
+            else:
+                # All weights are 0 (shouldn't happen, but fallback)
+                scores['comp_score'] = 0.5
+                scores['comp_data_quality'] = 'low'
+                scores['comp_warnings'] = ['No valid competitiveness data available']
+        else:
+            # No sources available - use default
+            scores['comp_score'] = 0.5
+            scores['comp_data_quality'] = 'low'
+            scores['comp_warnings'] = ['No competitiveness data available']
+            scores['source'] = 'Default'
+            if verbose:
+                print(f"  → No competitiveness data available, using default (0.5)")
+        
+        # --- CALCULATE SATURATION (if not already calculated from Kalshi) ---
+        # Saturation calculation depends on race level and whether we have Kalshi data
+        if scores.get('sat_score') is None:
+            # Saturation not yet calculated (no Kalshi market found, or poor match)
             if race_level == 'FEDERAL':
                 # Federal races: Always try FEC data (even if no Kalshi market found)
                 # Determine cycle from election year using improved calculation
