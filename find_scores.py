@@ -1,17 +1,99 @@
 """
 Election Donation Recommendation System
 
-This module calculates leverage scores for election races by combining:
-1. Competitiveness: How close the race is (from Kalshi markets or NANDA party data)
-2. Saturation: How much fundraising has already occurred (from FEC/Kalshi)
-3. Impact: Federal vs State level weighting
+This module calculates leverage scores for election races to help prioritize
+donations based on potential impact. It combines multiple data sources and
+factors to rank races by their donation leverage.
 
-Data Sources:
-- Civic Engine API: Election and race information
-- Kalshi API: Prediction markets for competitiveness
-- FEC API: Federal campaign finance data
-- Kalshi proxy: Market volume/spread as proxy for state races
-- NANDA: County-level party affiliation data for competitiveness
+CALCULATION METHOD:
+------------------
+Leverage Score = Competitiveness × Saturation
+
+1. Competitiveness (0-1): How close the race is
+   - Primary source: Kalshi prediction markets (real-time market prices)
+   - Fallback: Historical election results from Civic Engine API
+   - Last resort: NANDA county-level party affiliation data
+   - For primaries: Uses entropy-based calculation considering all candidates
+
+2. Saturation (0-1): How much fundraising has already occurred (inverse)
+   - Federal races: FEC campaign finance data (actual receipts)
+   - State races: Kalshi market volume/spread as proxy (when Kalshi market exists)
+   - Local races (city council, county): No saturation data available (excluded from calculation)
+   - Higher saturation = lower score (less opportunity for impact)
+   
+   NOTE: Kalshi proxy only works when a Kalshi market exists for the race (even if it's
+   a poor match). The proxy uses market volume and bid-ask spread as indicators:
+   - Low volume + high spread = less attention = lower saturation = higher score
+   - High volume + low spread = more attention = higher saturation = lower score
+   If no Kalshi market exists at all, saturation cannot be calculated for state/local races.
+
+DATA SOURCES:
+-------------
+- Civic Engine API: Election and race information, historical winners
+- Kalshi API: Prediction markets for competitiveness and market activity
+- FEC API: Federal campaign finance data (receipts, cycles, candidate info)
+- NANDA: County-level party affiliation data for competitiveness fallback
+
+FEATURES:
+---------
+- Date filtering: Filters races by election date (default: next 18 months)
+- Time-based prioritization: Races within 90 days get 10% boost, 180 days get 5% boost
+- Data quality indicators: Tracks data quality (high/medium/low/none) for transparency
+- Error handling: Retry logic with exponential backoff for API failures
+- Market validation: Validates Kalshi markets match target races (state, office, district, year)
+- Historical analysis: Uses past election results to assess competitiveness trends
+- Local race handling: Local races (city council, county) have no saturation data - saturation
+  excluded from leverage calculation (set to neutral 1.0) when no data available
+
+OUTPUT:
+-------
+Ranks races by leverage score and displays:
+- Leverage score and component scores (competitiveness, saturation)
+- Data sources and quality indicators
+- Days until election with visual indicators (IMMEDIATE, NEAR-TERM, etc.)
+- Warnings for data quality issues or validation problems
+- FEC cycle information for federal races
+- Kalshi market validation status
+
+HANDLING RACES WITH NO DATA:
+-----------------------------
+- Local races (city council, county, etc.): No saturation data available
+  - Saturation set to 1.0 (neutral, no penalty) when data unavailable
+  - Leverage score = Competitiveness × 1.0 (only competitiveness matters)
+  - Warnings indicate no saturation data available
+  
+- State races without Kalshi markets: No saturation data available
+  - Same handling as local races (neutral saturation value)
+  
+- Races without competitiveness data: Default to 0.5 (moderate competitiveness)
+  
+- Kalshi proxy explanation: The Kalshi market volume/spread proxy ONLY works when
+  a Kalshi market exists for the race (even if it's a poor match). If no market
+  exists at all, saturation cannot be calculated for state/local races and is
+  excluded from the leverage calculation (set to neutral 1.0).
+
+USAGE:
+------
+    python find_scores.py [max_races]
+    
+    Arguments:
+        max_races: Optional. Limit number of races to process (default: all)
+
+EXAMPLE:
+--------
+    python find_scores.py 10  # Process first 10 races
+    
+    Output:
+        #1: U.S. House - North Carolina 2nd District (FEDERAL)
+          Type: U.S. House of Representatives
+          Election Day: 2025-11-05
+          🚨 Election in 45 days (IMMEDIATE)
+          Leverage Score: 0.740
+          Data Sources: Kalshi + FEC
+            > Competitiveness: 0.740 (quality: high)
+            > Saturation: 0.100 (quality: high)
+            ✓ Kalshi Market Validation: GOOD MATCH (score: 0.85)
+            📅 FEC Cycle: 2024
 
 """
 
@@ -1323,8 +1405,8 @@ def get_civic_engine_races(max_months_ahead: Optional[int] = 18, filter_past: bo
     
     for attempt in range(max_retries):
         try:
-            # Get elections from Civic Engine API (verbose=False to reduce output)
-            elections_dict = get_current_state_federal_elections(max_elections=100, verbose=False)
+            # Get elections from Civic Engine API
+            elections_dict = get_current_state_federal_elections(max_elections=100)
             
             # Extract individual races from elections
             races = []
@@ -1568,7 +1650,12 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                         if verbose:
                             print(f"  FEC: Using cycle {cycle} for election year {election_year}")
                     else:
-                        # State races: Use Kalshi proxy for all states
+                        # State races: Use Kalshi proxy ONLY if a Kalshi market was found
+                        # Note: This proxy only works when a market exists (even if it's a poor match).
+                        # The proxy uses market volume and spread as indicators of campaign attention:
+                        # - Low volume + high spread = less attention = lower saturation = higher score
+                        # - High volume + low spread = more attention = higher saturation = lower score
+                        # If no market exists at all, saturation cannot be calculated (will be None).
                         volume = market_series.get('total_series_volume', 0) or 0
                         sat_score, sat_metadata = calculate_saturation_kalshi(volume, spread, verbose=verbose)
                         scores['sat_score'] = sat_score
@@ -1662,7 +1749,13 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                         print(f"  → No NANDA data available, using default competitiveness")
             
             # 2. Calculate Saturation
+            # For races without Kalshi markets, saturation depends on race level:
+            # - Federal races: Always try FEC (even without Kalshi)
+            # - State races: Only have saturation if Kalshi market exists (already handled above if Kalshi found)
+            # - Local races (city council, county): No data sources available
+            
             if race_level == 'FEDERAL':
+                # Federal races: Always try FEC data (even if no Kalshi market found)
                 # Determine cycle from election year using improved calculation
                 try:
                     from datetime import date
@@ -1702,12 +1795,24 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                 if verbose:
                     print(f"  FEC: Using cycle {cycle} for election year {election_year}")
             else:
-                # State races: No Kalshi market = no saturation data available
+                # State/local races without Kalshi market: No saturation data available
+                # This includes:
+                # - State races without Kalshi markets
+                # - Local races (city council, county, etc.) - no data sources available
                 scores['sat_score'] = None  # Mark as unavailable
                 scores['sat_data_quality'] = 'none'
-                scores['sat_warnings'] = ['No saturation data available - Kalshi market not found']
-                if verbose:
-                    print(f"  ⚠️  No saturation data available for state race (no Kalshi market)")
+                
+                # Determine if this is a local race (city council, county, etc.)
+                is_local_race = race_level not in ['FEDERAL', 'STATE'] or 'city' in race_name.lower() or 'county' in race_name.lower() or 'council' in race_name.lower()
+                
+                if is_local_race:
+                    scores['sat_warnings'] = ['No saturation data available for local race - no data sources (FEC, Kalshi, NANDA) cover local races']
+                    if verbose:
+                        print(f"  ⚠️  Local race detected - no saturation data sources available")
+                else:
+                    scores['sat_warnings'] = ['No saturation data available - Kalshi market not found for state race']
+                    if verbose:
+                        print(f"  ⚠️  No saturation data available for state race (no Kalshi market)")
                 
             if verbose:
                 data_sources = []
@@ -1720,21 +1825,24 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
                 print(f"  → Data sources: {', '.join(data_sources)}")
 
         # --- FINAL LEVERAGE SCORE ---
-        # We also add an Impact_Score (Federal/State > Local)
-        impact_score = 1.0 if race_level == 'FEDERAL' else 0.8
+        # Leverage Score = Competitiveness × Saturation
+        # (Impact weighting removed - all races treated equally)
         
-        # Handle missing saturation score (state races without Kalshi)
+        # Handle missing saturation score (races without data: local races, state races without Kalshi)
         sat_score = scores.get('sat_score')
         if sat_score is None:
-            # If no saturation data, exclude from ranking or use a default
-            # For now, we'll use a moderate default but flag it
-            sat_score = 0.5
+            # No saturation data available (e.g., city council, county races, state races without Kalshi)
+            # Exclude saturation from calculation (set to 1.0 = no penalty, but flag as unknown)
+            sat_score = 1.0  # Neutral value - no saturation penalty when data unavailable
             if 'sat_warnings' not in scores:
                 scores['sat_warnings'] = []
-            scores['sat_warnings'].append('Using default saturation (no data available)')
+            scores['sat_warnings'].append('No saturation data available - saturation excluded from leverage calculation')
+            scores['sat_data_quality'] = 'none'
+            if verbose:
+                print(f"  ⚠️  No saturation data available - using neutral value (1.0) for leverage calculation")
         
         scores['leverage_score'] = (
-            scores['comp_score'] * sat_score * impact_score
+            scores['comp_score'] * sat_score
         )
         
         # Store data quality info
