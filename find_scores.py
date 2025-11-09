@@ -2,6 +2,8 @@ import requests
 import math
 import re
 from get_civicengine import get_current_state_federal_elections
+from credentials import FEC_TOKEN
+from typing import Optional, Dict, Any
 
 def clean_search_query(race_name):
     """Cleans a CivicEngine race name into a good Kalshi search query."""
@@ -96,13 +98,229 @@ def calculate_competitiveness_primary(markets):
     gap_score = max(0, (1 - ((p1 - p2) / 100)))
     return leader_score * gap_score
 
-def calculate_saturation_fec(race_name):
-    """MOCK: Gets FEC data for Federal races."""
-    # In a real app, query FEC API: api.open.fec.gov
-    # We mock high fundraising for these major races
-    if "Senate" in race_name or "House" in race_name:
-        return 1 / math.log(1 + 20_000_000) # Simulating $20M raised
-    return 1 # Default
+def parse_race_name(race_name):
+    """
+    Parse a race name to extract office type, state, and district.
+    
+    Returns:
+        dict with keys: 'office' ('S' or 'H'), 'state' (2-letter code), 'district' (int or None)
+    """
+    # State abbreviations mapping
+    state_abbrev = {
+        'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR',
+        'California': 'CA', 'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE',
+        'Florida': 'FL', 'Georgia': 'GA', 'Hawaii': 'HI', 'Idaho': 'ID',
+        'Illinois': 'IL', 'Indiana': 'IN', 'Iowa': 'IA', 'Kansas': 'KS',
+        'Kentucky': 'KY', 'Louisiana': 'LA', 'Maine': 'ME', 'Maryland': 'MD',
+        'Massachusetts': 'MA', 'Michigan': 'MI', 'Minnesota': 'MN', 'Mississippi': 'MS',
+        'Missouri': 'MO', 'Montana': 'MT', 'Nebraska': 'NE', 'Nevada': 'NV',
+        'New Hampshire': 'NH', 'New Jersey': 'NJ', 'New Mexico': 'NM', 'New York': 'NY',
+        'North Carolina': 'NC', 'North Dakota': 'ND', 'Ohio': 'OH', 'Oklahoma': 'OK',
+        'Oregon': 'OR', 'Pennsylvania': 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC',
+        'South Dakota': 'SD', 'Tennessee': 'TN', 'Texas': 'TX', 'Utah': 'UT',
+        'Vermont': 'VT', 'Virginia': 'VA', 'Washington': 'WA', 'West Virginia': 'WV',
+        'Wisconsin': 'WI', 'Wyoming': 'WY', 'District of Columbia': 'DC'
+    }
+    
+    result = {'office': None, 'state': None, 'district': None}
+    
+    # Check for Senate race
+    if 'U.S. Senate' in race_name or 'Senate' in race_name:
+        result['office'] = 'S'
+        # Extract state name
+        for state_name, abbrev in state_abbrev.items():
+            if state_name in race_name:
+                result['state'] = abbrev
+                break
+    
+    # Check for House race
+    elif 'U.S. House' in race_name or 'House of Representatives' in race_name:
+        result['office'] = 'H'
+        # Extract state name
+        for state_name, abbrev in state_abbrev.items():
+            if state_name in race_name:
+                result['state'] = abbrev
+                break
+        
+        # Extract district number
+        district_match = re.search(r'(\d+)(?:st|nd|rd|th)?\s+Congressional District', race_name)
+        if district_match:
+            result['district'] = int(district_match.group(1))
+        else:
+            # Try alternative pattern
+            district_match = re.search(r'District\s+(\d+)', race_name)
+            if district_match:
+                result['district'] = int(district_match.group(1))
+    
+    return result
+
+
+def get_fec_candidates_total_receipts(office: str, state: str, district: Optional[int] = None, 
+                                      cycle: int = 2024, verbose: bool = False) -> float:
+    """
+    Query FEC API to get total receipts (fundraising) for all candidates in a race.
+    
+    Args:
+        office: 'S' for Senate, 'H' for House
+        state: Two-letter state code
+        district: District number for House races (None for Senate)
+        cycle: Election cycle year (default: 2024)
+        verbose: Whether to print debug information
+    
+    Returns:
+        Total receipts in dollars (sum of all candidates)
+    """
+    base_url = "https://api.open.fec.gov/v1/candidates/"
+    
+    # Check both the current cycle and the previous cycle to get complete data
+    # FEC cycles are 2-year periods, so check current and previous 2-year cycle
+    cycles_to_check = [cycle]
+    if cycle >= 2024:
+        cycles_to_check.insert(0, cycle - 2)  # Also check previous cycle (insert first to prioritize)
+    # Remove duplicates and sort (most recent first)
+    cycles_to_check = sorted(set(cycles_to_check), reverse=True)
+    
+    total_receipts = 0.0
+    candidate_ids_seen = set()
+    
+    for check_cycle in cycles_to_check:
+        params = {
+            'api_key': FEC_TOKEN,
+            'office': office,
+            'state': state,
+            'cycle': check_cycle,
+            'per_page': 100,
+            'election_year': check_cycle if check_cycle == cycle else None,  # Only set for primary cycle
+        }
+        
+        # Remove None values
+        params = {k: v for k, v in params.items() if v is not None}
+        
+        if office == 'H' and district is not None:
+            params['district'] = str(district).zfill(2)  # FEC expects 2-digit district
+        
+        try:
+            response = requests.get(base_url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            candidates = data.get('results', [])
+            
+            if verbose and candidates:
+                print(f"  FEC: Found {len(candidates)} candidates for {state} {office}{district or ''} (cycle {check_cycle})")
+            
+            for candidate in candidates:
+                candidate_id = candidate.get('candidate_id')
+                if not candidate_id or candidate_id in candidate_ids_seen:
+                    continue
+                
+                candidate_ids_seen.add(candidate_id)
+                
+                # Try to get totals for this candidate across multiple cycles
+                max_receipts = 0.0
+                for total_cycle in cycles_to_check:
+                    totals_url = f"https://api.open.fec.gov/v1/candidate/{candidate_id}/totals/"
+                    totals_params = {
+                        'api_key': FEC_TOKEN,
+                        'cycle': total_cycle,
+                        'per_page': 100  # Get all totals for this cycle
+                    }
+                    
+                    try:
+                        totals_response = requests.get(totals_url, params=totals_params, timeout=10)
+                        totals_response.raise_for_status()
+                        totals_data = totals_response.json()
+                        
+                        totals_list = totals_data.get('results', [])
+                        for total in totals_list:
+                            receipts = total.get('receipts', 0) or 0
+                            max_receipts = max(max_receipts, float(receipts))
+                    except requests.RequestException:
+                        # If we can't get totals for this cycle, continue
+                        continue
+                
+                if max_receipts > 0:
+                    total_receipts += max_receipts
+                    if verbose:
+                        print(f"  FEC: Candidate {candidate_id}: ${max_receipts:,.0f}")
+            
+        except requests.RequestException as e:
+            if verbose:
+                print(f"  FEC API error for cycle {check_cycle}: {e}")
+            continue
+        except (KeyError, ValueError, TypeError) as e:
+            if verbose:
+                print(f"  FEC API parsing error for cycle {check_cycle}: {e}")
+            continue
+    
+    if verbose and total_receipts > 0:
+        print(f"  FEC: Total receipts: ${total_receipts:,.0f}")
+    
+    return total_receipts
+
+
+def calculate_saturation_fec(race_name: str, cycle: int = 2024, verbose: bool = False) -> float:
+    """
+    Gets FEC data for Federal races and calculates saturation score.
+    
+    Saturation is inversely related to total fundraising:
+    - Higher fundraising = more saturated = lower score (penalty)
+    - Lower fundraising = less saturated = higher score (opportunity)
+    
+    Formula: 1 / log(1 + total_receipts)
+    This means:
+    - $0 raised: score = 1.0 (highest, no saturation)
+    - $1M raised: score ≈ 0.14
+    - $10M raised: score ≈ 0.10
+    - $100M raised: score ≈ 0.09
+    
+    Args:
+        race_name: Name of the race (e.g., "U.S. Senate - North Carolina")
+        cycle: Election cycle year (default: 2024)
+        verbose: Whether to print debug information
+    
+    Returns:
+        Saturation score between 0 and 1 (higher = less saturated)
+    """
+    # Parse race name to get office, state, district
+    race_info = parse_race_name(race_name)
+    
+    if not race_info['office'] or not race_info['state']:
+        # Can't parse race, return default moderate score
+        if verbose:
+            print(f"  FEC: Could not parse race name: {race_name}")
+        return 1 / math.log(1 + 10_000_000)  # Default to $10M equivalent
+    
+    if verbose:
+        print(f"  FEC: Querying {race_info['office']} race in {race_info['state']}" + 
+              (f" District {race_info['district']}" if race_info['district'] else ""))
+    
+    # Get total receipts for the race
+    total_receipts = get_fec_candidates_total_receipts(
+        office=race_info['office'],
+        state=race_info['state'],
+        district=race_info.get('district'),
+        cycle=cycle,
+        verbose=verbose
+    )
+    
+    if total_receipts == 0:
+        # No fundraising data found, treat as low saturation
+        if verbose:
+            print(f"  FEC: No fundraising data found, treating as low saturation")
+        return 1.0
+    
+    # Calculate saturation score: inverse log relationship
+    # Using log ensures diminishing returns and prevents extreme values
+    saturation_score = 1 / math.log(1 + total_receipts)
+    
+    # Normalize to reasonable range (clamp between 0.05 and 1.0)
+    saturation_score = max(0.05, min(1.0, saturation_score))
+    
+    if verbose:
+        print(f"  FEC: Saturation score: {saturation_score:.3f} (receipts: ${total_receipts:,.0f})")
+    
+    return saturation_score
 
 def calculate_saturation_kalshi(volume, spread):
     """Uses Kalshi's own metrics as a proxy for saturation/attention."""
@@ -236,7 +454,14 @@ def process_races(max_races=None, verbose=True):
                     # 2. Calculate Saturation
                     if race_level == 'FEDERAL':
                         # Federal races always use FEC data
-                        scores['sat_score'] = calculate_saturation_fec(race_name)
+                        # Determine cycle from election year
+                        try:
+                            election_year = int(election_day.split('-')[0]) if election_day else 2024
+                            # FEC cycles are typically even years, use the cycle before the election
+                            cycle = election_year - 1 if election_year % 2 == 1 else election_year
+                        except (ValueError, AttributeError):
+                            cycle = 2024
+                        scores['sat_score'] = calculate_saturation_fec(race_name, cycle=cycle, verbose=verbose)
                         scores['source'] += " + FEC"
                     else:
                         # State races must use Kalshi proxy
@@ -265,7 +490,14 @@ def process_races(max_races=None, verbose=True):
             
             # 2. Calculate Saturation
             if race_level == 'FEDERAL':
-                scores['sat_score'] = calculate_saturation_fec(race_name)
+                # Determine cycle from election year
+                try:
+                    election_year = int(election_day.split('-')[0]) if election_day else 2024
+                    # FEC cycles are typically even years, use the cycle before the election
+                    cycle = election_year - 1 if election_year % 2 == 1 else election_year
+                except (ValueError, AttributeError):
+                    cycle = 2024
+                scores['sat_score'] = calculate_saturation_fec(race_name, cycle=cycle, verbose=verbose)
                 scores['source'] += " + FEC"
             else:
                 # No Kalshi market = low visibility = HIGH score
