@@ -13,7 +13,7 @@ from typing import List, Dict, Any, Optional
 from datetime import date, timedelta
 import re
 
-def get_historical_winners_from_position(race_name: str, verbose: bool = False) -> List[Dict[str, Any]]:
+def get_historical_winners_from_position(race_name: str, election_name: Optional[str] = None, verbose: bool = False) -> List[Dict[str, Any]]:
     """
     Get historical winners for a position by querying all past races for that position.
     
@@ -25,23 +25,36 @@ def get_historical_winners_from_position(race_name: str, verbose: bool = False) 
     5. Extract winners from candidacies with result = "WON"
     
     Args:
-        race_name: Name of the race (e.g., "U.S. House of Representatives - Alabama 1st Congressional District")
+        race_name: Name of the race (e.g., "U.S. House of Representatives - Alabama 1st Congressional District" or "Mount Vernon City Council")
+        election_name: Optional election name (used to extract state for local races)
         verbose: Whether to print debug info
     
     Returns:
         List of winner dictionaries with year, name, party, and election info
     """
-    # Parse race name to extract office type, state, and level (FEDERAL vs STATE)
-    # Try to determine if it's a federal or state race
-    race_level = 'FEDERAL' if 'U.S.' in race_name or 'United States' in race_name else 'STATE'
+    # Parse race name to extract office type, state, and level (FEDERAL vs STATE vs CITY)
+    # Try to determine if it's a federal, state, or city race
+    is_city_race = 'City' in race_name or 'Mayor' in race_name or 'Council' in race_name
+    is_federal = 'U.S.' in race_name or 'United States' in race_name
     
-    race_info = parse_race_name(race_name)
-    if not race_info.get('state'):
+    if is_city_race:
+        race_level = 'CITY'
+    elif is_federal:
+        race_level = 'FEDERAL'
+    else:
+        race_level = 'STATE'
+    
+    # For local races, state may be in election_name
+    race_info = parse_race_name(race_name, election_name=election_name)
+    
+    # For city races, we may not have state in race_name, but we need it for filtering
+    # For federal/state races, we need state
+    if not race_info.get('state') and race_level != 'CITY':
         if verbose:
             print(f"  Could not parse state from race: {race_name}")
         return []
     
-    state = race_info['state']
+    state = race_info.get('state')
     
     # Determine district (only for House races and some state races)
     district = race_info.get('district')
@@ -62,6 +75,22 @@ def get_historical_winners_from_position(race_name: str, verbose: bool = False) 
     elif 'Governor' in race_name:
         office_type = 'GOVERNOR'
         district = None
+    elif is_city_race:
+        # City/local race - extract city name and office type from race_name
+        # Examples: "Mount Vernon City Council", "New York City Mayor", "Albany City Mayor"
+        if 'Mayor' in race_name:
+            office_type = 'MAYOR'
+        elif 'Council' in race_name:
+            office_type = 'COUNCIL'
+        else:
+            office_type = 'CITY'
+        # Extract city name (everything before "City" or at the start)
+        city_match = re.search(r'^([^C]+?)\s+City', race_name)
+        if city_match:
+            city_name = city_match.group(1).strip()
+        else:
+            # Fallback: use race_name as search pattern
+            city_name = race_name
     else:
         # Try to use parsed office type
         office_type = race_info.get('office')
@@ -84,11 +113,12 @@ def get_historical_winners_from_position(race_name: str, verbose: bool = False) 
         'VT': 'Vermont', 'VA': 'Virginia', 'WA': 'Washington', 'WV': 'West Virginia',
         'WI': 'Wisconsin', 'WY': 'Wyoming', 'DC': 'District of Columbia'
     }
-    state_full = state_names.get(state, state)
+    state_full = state_names.get(state, state) if state else None
     
     # Build search pattern based on office type and level
     # For federal races: "U.S. House/Senate - State"
     # For state races: "State Office - State" or "State Office - State District X"
+    # For city races: "City Name City Council" or "City Name Mayor"
     if office_type == 'H':
         # Federal House
         if district is not None:
@@ -113,11 +143,17 @@ def get_historical_winners_from_position(race_name: str, verbose: bool = False) 
     elif office_type == 'GOVERNOR':
         # Governor
         search_pattern = f"{state_full} Governor"
+    elif is_city_race:
+        # City race - use the race_name directly or city name
+        # Civic Engine position names for city races are typically like:
+        # "Mount Vernon City Council", "New York City Mayor", etc.
+        search_pattern = race_name  # Use full race name for city positions
     else:
         # Try to use state and parts of race name
-        search_pattern = state_full
+        search_pattern = state_full if state_full else race_name
     
     # Build query based on level - GraphQL needs the enum value directly in the query
+    # Civic Engine supports FEDERAL, STATE, COUNTY, and CITY levels
     if race_level == 'FEDERAL':
         query = '''
         query GetPositionAndRaces($positionName: String!) {
@@ -155,7 +191,45 @@ def get_historical_winners_from_position(race_name: str, verbose: bool = False) 
           }
         }
         '''
+    elif race_level == 'CITY':
+        query = '''
+        query GetPositionAndRaces($positionName: String!) {
+          positions(
+            filterBy: {
+              name: { contains: $positionName }
+              level: CITY
+            }
+            first: 20
+          ) {
+            nodes {
+              id
+              name
+              level
+              races(first: 100, orderBy: {field: ELECTION_DAY, direction: DESC}) {
+                nodes {
+                  id
+                  election {
+                    id
+                    name
+                    electionDay
+                  }
+                  candidacies {
+                    id
+                    candidate {
+                      id
+                      fullName
+                      bioguideId
+                    }
+                    result
+                  }
+                }
+              }
+            }
+          }
+        }
+        '''
     else:
+        # STATE level (or default)
         query = '''
         query GetPositionAndRaces($positionName: String!) {
           positions(
@@ -413,16 +487,18 @@ def get_historical_winners_from_position(race_name: str, verbose: bool = False) 
         return []
 
 
-def get_historical_winners_civicengine(race_name: str, years_back: int = 6, verbose: bool = False) -> List[Dict[str, Any]]:
+def get_historical_winners_civicengine(race_name: str, years_back: int = 6, election_name: Optional[str] = None, verbose: bool = False) -> List[Dict[str, Any]]:
     """
-    Get historical winners for a House race using Civic Engine GraphQL API.
+    Get historical winners for a race using Civic Engine GraphQL API.
     
     This function queries the Position, then gets all past Races for that position,
     and extracts winners from Candidacies with result = "WON".
+    Works for federal, state, and city/local races.
     
     Args:
         race_name: Name of the race
         years_back: How many years back to filter (not used directly - gets all past races)
+        election_name: Optional election name (used to extract state for local races)
         verbose: Whether to print debug info
     
     Returns:
@@ -432,7 +508,8 @@ def get_historical_winners_civicengine(race_name: str, years_back: int = 6, verb
         print(f"  CivicEngine Historical: Getting historical winners for {race_name}")
     
     # Get all historical winners from the position
-    winners = get_historical_winners_from_position(race_name, verbose=verbose)
+    # Pass election_name to help extract state for local races
+    winners = get_historical_winners_from_position(race_name, election_name=election_name, verbose=verbose)
     
     if verbose:
         if winners:

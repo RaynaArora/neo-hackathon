@@ -274,6 +274,7 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
                                     nanda_data: Dict[str, List[Dict[str, Any]]],
                                     year: Optional[int] = None,
                                     race_level: Optional[str] = None,
+                                    election_name: Optional[str] = None,
                                     verbose: bool = False) -> float:
     """
     Calculate competitiveness score using NANDA party split data.
@@ -287,17 +288,19 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
         nanda_data: NANDA data organized by FIPS code
         year: Election year (uses most recent data if not specified)
         race_level: Level of race (FEDERAL, STATE, COUNTY, etc.) - helps determine aggregation
+        election_name: Optional election name (used to extract state for local races)
         verbose: Whether to print debug information
     
     Returns:
         Competitiveness score between 0 and 1 (higher = more competitive)
     """
     # Extract state from race name using parse_race_name
-    race_info = parse_race_name(race_name)
+    # For local races, state may be in election_name
+    race_info = parse_race_name(race_name, election_name=election_name)
     state_abbrev = race_info.get('state')
     if not state_abbrev:
         if verbose:
-            print(f"  NANDA: Could not extract state from race name: {race_name}")
+            print(f"  NANDA: Could not extract state from race name or election name: {race_name}")
         return 0.5  # Default moderate competitiveness
     
     # Get state FIPS code
@@ -308,13 +311,15 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
         return 0.5
     
     # Determine which ratio field to use based on race type
-    ratio_field = None
+    # Try multiple ratio fields as fallback (in order of preference)
+    ratio_fields = []
     if race_type == ElectionType.US_SENATE or race_type == ElectionType.STATE_SENATE:
-        ratio_field = 'sen_dem_ratio'
+        ratio_fields = ['sen_dem_ratio', 'pres_dem_ratio']  # Prefer sen, fallback to pres
     elif race_type == ElectionType.US_HOUSE or race_type == ElectionType.STATE_HOUSE:
-        ratio_field = 'pres_dem_ratio'  # Use presidential as proxy for House
+        ratio_fields = ['pres_dem_ratio', 'sen_dem_ratio']  # Prefer pres, fallback to sen
     else:
-        ratio_field = 'pres_dem_ratio'  # Default to presidential
+        # For city/local races, try both ratios
+        ratio_fields = ['pres_dem_ratio', 'sen_dem_ratio']
     
     # For county races, try to find county-specific data
     # TODO: Implement county name extraction and FIPS matching for county-specific data
@@ -322,17 +327,21 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
     use_county_specific = False
     county_fips = None
     
-    # Check if this is a county race and try to extract county name
+    # Check if this is a county/city race and try to extract county name
     if race_level and race_level not in ['FEDERAL', 'STATE']:
-        # Could be county race - try to extract county name from race name
+        # Could be county/city race - try to extract county name from race name
         # This is a future improvement - would need county name → FIPS mapping
         if verbose:
-            print(f"  NANDA: County race detected, but county-specific matching not yet implemented (using state aggregation)")
+            print(f"  NANDA: {race_level} race detected, using state-level aggregation")
     
     # Collect ratios from counties in the state
     # If county-specific FIPS found, use only that county; otherwise aggregate all counties
+    # If year is None, use the most recent year's data
     state_ratios = []
+    available_years = set()
     
+    # First pass: collect all available years and records
+    all_records = []
     for fips, records in nanda_data.items():
         if fips.startswith(state_fips_prefix):
             # If we have county-specific FIPS, only use that county
@@ -340,17 +349,45 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
                 continue
             
             for record in records:
-                if year is None or record['year'] == year:
-                    ratio = record.get(ratio_field)
-                    if ratio is not None:
-                        state_ratios.append(ratio)
+                available_years.add(record['year'])
+                # Collect all records (we'll filter by year after determining latest year)
+                all_records.append(record)
+    
+    if not all_records:
+        if verbose:
+            print(f"  NANDA: No records found for {state_abbrev} ({state_fips_prefix}*)")
+        return 0.5
+    
+    # Determine which year to use
+    # If year is specified, try to use that year; otherwise use most recent available year
+    target_year = year
+    if target_year is None or target_year not in available_years:
+        target_year = max(available_years)
+        if verbose:
+            print(f"  NANDA: Using most recent available year: {target_year}")
+    
+    # Filter records to target year
+    year_records = [r for r in all_records if r['year'] == target_year]
+    
+    # Try each ratio field in order until we find data
+    ratio_field_used = None
+    for ratio_field in ratio_fields:
+        state_ratios = []
+        for record in year_records:
+            ratio = record.get(ratio_field)
+            if ratio is not None:
+                state_ratios.append(ratio)
+        
+        if state_ratios:
+            ratio_field_used = ratio_field
+            break  # Found data with this ratio field
     
     if not state_ratios:
         if verbose:
             if county_fips:
-                print(f"  NANDA: No data found for county {county_fips}")
+                print(f"  NANDA: No data found for county {county_fips} (tried {', '.join(ratio_fields)})")
             else:
-                print(f"  NANDA: No data found for {state_abbrev} ({state_fips_prefix}*)")
+                print(f"  NANDA: No data found for {state_abbrev} ({state_fips_prefix}*) (tried {', '.join(ratio_fields)})")
         return 0.5  # Default moderate competitiveness
     
     # Calculate average party split
@@ -364,11 +401,12 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
     competitiveness = max(0.0, min(1.0, competitiveness))
     
     if verbose:
+        ratio_info = f" (using {ratio_field_used})" if ratio_field_used else ""
         if county_fips:
-            print(f"  NANDA: County {county_fips}: Dem {avg_dem_ratio:.1%}, Rep {avg_rep_ratio:.1%}")
+            print(f"  NANDA: County {county_fips} ({target_year}): Dem {avg_dem_ratio:.1%}, Rep {avg_rep_ratio:.1%}{ratio_info}")
             print(f"  NANDA: Competitiveness score: {competitiveness:.3f} (county-specific)")
         else:
-            print(f"  NANDA: State {state_abbrev}: Dem {avg_dem_ratio:.1%}, Rep {avg_rep_ratio:.1%}")
+            print(f"  NANDA: State {state_abbrev} ({target_year}): Dem {avg_dem_ratio:.1%}, Rep {avg_rep_ratio:.1%}{ratio_info}")
             print(f"  NANDA: Competitiveness score: {competitiveness:.3f} (based on {len(state_ratios)} counties, state-level aggregation)")
     
     return competitiveness
@@ -379,7 +417,8 @@ def calculate_competitiveness_nanda(race_name: str, race_type: ElectionType,
 # ============================================================================
 
 def get_historical_election_results(race_name: str, position_id: Optional[str] = None, 
-                                     years_back: int = 4, verbose: bool = False) -> List[Dict[str, Any]]:
+                                     years_back: int = 4, election_name: Optional[str] = None,
+                                     verbose: bool = False) -> List[Dict[str, Any]]:
     """
     Get historical election results for a specific race from Civic Engine API.
     
@@ -392,16 +431,27 @@ def get_historical_election_results(race_name: str, position_id: Optional[str] =
         race_name: Name of the race (e.g., "U.S. House of Representatives - North Carolina 2nd Congressional District")
         position_id: Optional position ID from Civic Engine (not currently used)
         years_back: How many years back to look for historical elections (default: 4)
+        election_name: Optional election name (used to extract state for local races)
         verbose: Whether to print debug information
     
     Returns:
         List of historical election results with winner and party information
     """
     # Parse race to get office, state, district
-    race_info = parse_race_name(race_name)
-    if not race_info['office'] or not race_info['state']:
+    # For local races, state may be in election_name
+    race_info = parse_race_name(race_name, election_name=election_name)
+    
+    # For historical data, we need at least a state (office is optional for local races)
+    if not race_info['state']:
         if verbose:
-            print(f"  Historical: Could not parse race name: {race_name}")
+            print(f"  Historical: Could not extract state from race name or election name: {race_name}")
+        return []
+    
+    # For federal races, we need office type
+    # For local/state races, office can be None (we'll search by position name)
+    if race_info.get('office') and not race_info['state']:
+        if verbose:
+            print(f"  Historical: Could not extract state from race name: {race_name}")
         return []
     
     # Historical data should work for all race types that have positions in Civic Engine
@@ -558,6 +608,7 @@ def get_candidate_party_from_fec(candidate_name: str, bioguide_id: Optional[str]
 
 
 def calculate_competitiveness_from_historical(race_name: str, race_type: ElectionType,
+                                               election_name: Optional[str] = None,
                                                verbose: bool = False) -> Tuple[float, Dict[str, Any]]:
     """
     Calculate competitiveness score from historical election results.
@@ -584,7 +635,8 @@ def calculate_competitiveness_from_historical(race_name: str, race_type: Electio
     }
     
     # Get historical election results from Civic Engine
-    historical_results = get_historical_election_results(race_name, years_back=6, verbose=verbose)
+    # Pass election_name to help extract state for local races
+    historical_results = get_historical_election_results(race_name, years_back=6, election_name=election_name, verbose=verbose)
     
     if not historical_results:
         if verbose:
@@ -1057,20 +1109,34 @@ STATE_NAME_TO_ABBREV = {
     'Wisconsin': 'WI', 'Wyoming': 'WY', 'District of Columbia': 'DC'
 }
 
-def parse_race_name(race_name):
+def parse_race_name(race_name, election_name: Optional[str] = None):
     """
     Parse a race name to extract office type, state, and district.
+    
+    For local races (city, county), the state may be in the election_name rather than race_name.
+    For example: race_name="Mount Vernon City Council", election_name="New York General Election"
+    
+    Args:
+        race_name: Name of the race
+        election_name: Optional election name (used to extract state for local races)
     
     Returns:
         dict with keys: 'office' ('S' or 'H'), 'state' (2-letter code), 'district' (int or None)
     """
     result = {'office': None, 'state': None, 'district': None}
     
-    # Extract state name (works for all race types)
+    # Extract state name from race_name first (works for federal/state races)
     for state_name, abbrev in STATE_NAME_TO_ABBREV.items():
         if state_name in race_name:
             result['state'] = abbrev
             break
+    
+    # If state not found in race_name, try election_name (for local races)
+    if not result['state'] and election_name:
+        for state_name, abbrev in STATE_NAME_TO_ABBREV.items():
+            if state_name in election_name:
+                result['state'] = abbrev
+                break
     
     # Check for Senate race
     if 'U.S. Senate' in race_name or ('Senate' in race_name and 'U.S.' in race_name):
@@ -1413,6 +1479,100 @@ def calculate_saturation_kalshi(volume, spread, verbose: bool = False) -> Tuple[
     return saturation_score, metadata
 
 # ============================================================================
+# CSV DATA LOADING
+# ============================================================================
+
+def load_races_from_csv(csv_path: str = "issue_relevance_scores.csv", 
+                       max_months_ahead: Optional[int] = 18, 
+                       filter_past: bool = True) -> List[Dict[str, Any]]:
+    """
+    Load races from issue_relevance_scores.csv file.
+    
+    Args:
+        csv_path: Path to the CSV file (default: "issue_relevance_scores.csv")
+        max_months_ahead: Maximum months into the future to include races (default: 18)
+        filter_past: Whether to filter out past elections (default: True)
+    
+    Returns:
+        List of race dictionaries with the same format as get_civic_engine_races
+    """
+    races = []
+    today = datetime.now().date()
+    seen_races = set()  # Track unique races to avoid duplicates
+    
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            
+            for row in reader:
+                # Extract fields from CSV
+                election_name = row.get('election_name', '').strip()
+                race_name = row.get('race_name', '').strip()
+                race_level = row.get('race_level', '').strip()
+                election_day = row.get('election_day', '').strip()
+                position = row.get('position', '').strip()
+                
+                # Skip if missing required fields
+                if not race_name or not race_level or not election_day:
+                    continue
+                
+                # Create unique key for this race (election_name + race_name + election_day)
+                race_key = (election_name, race_name, election_day)
+                if race_key in seen_races:
+                    continue  # Skip duplicates
+                seen_races.add(race_key)
+                
+                # Parse election date
+                try:
+                    election_date = datetime.strptime(election_day, '%Y-%m-%d').date()
+                except (ValueError, TypeError):
+                    # Try alternative date formats if needed
+                    try:
+                        election_date = datetime.strptime(election_day, '%Y/%m/%d').date()
+                    except (ValueError, TypeError):
+                        election_date = None
+                
+                # Filter by date if specified
+                if filter_past and election_date and election_date < today:
+                    continue  # Skip past elections
+                
+                if max_months_ahead and election_date:
+                    months_ahead = (election_date.year - today.year) * 12 + (election_date.month - today.month)
+                    if months_ahead > max_months_ahead:
+                        continue  # Skip races too far in the future
+                
+                # Classify election type
+                election_type = classify_election_type(race_name, race_level)
+                
+                # Calculate days until election for prioritization
+                days_until = None
+                if election_date:
+                    days_until = (election_date - today).days
+                
+                races.append({
+                    'name': race_name,
+                    'level': race_level,
+                    'day': election_day,
+                    'election_name': election_name,
+                    'race_id': '',  # CSV doesn't have race_id
+                    'election_type': election_type,
+                    'election_type_desc': get_election_type_description(election_type),
+                    'days_until': days_until,
+                    'election_date': election_date.isoformat() if election_date else None,
+                    'position': position  # Store position from CSV
+                })
+        
+        return races
+        
+    except FileNotFoundError:
+        print(f"Warning: CSV file '{csv_path}' not found. Returning empty list.")
+        return []
+    except Exception as e:
+        print(f"Error loading races from CSV '{csv_path}': {e}")
+        return []
+
+
+# ============================================================================
 # CIVIC ENGINE API INTEGRATION
 # ============================================================================
 
@@ -1507,7 +1667,8 @@ def get_civic_engine_races(max_months_ahead: Optional[int] = 18, filter_past: bo
 # ============================================================================
 
 def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None,
-                  max_months_ahead: Optional[int] = 18, filter_past: bool = True):
+                  max_months_ahead: Optional[int] = 18, filter_past: bool = True,
+                  csv_path: Optional[str] = None):
     """
     Main function to process all races and generate a ranked list.
     
@@ -1517,6 +1678,8 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
         nanda_year: Year to use for NANDA data (uses most recent if None)
         max_months_ahead: Maximum months into the future to include races (default: 18)
         filter_past: Whether to filter out past elections (default: True)
+        csv_path: Optional path to CSV file to load races from. If provided, uses CSV instead of Civic Engine API.
+                  If None, uses Civic Engine API (default: None)
     """
     # Load NANDA data once for all races
     if verbose:
@@ -1525,8 +1688,16 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
     if verbose:
         print(f"Loaded NANDA data: {len(nanda_data)} FIPS codes")
     
-    # Get races from Civic Engine API (with date filtering)
-    races = get_civic_engine_races(max_months_ahead=max_months_ahead, filter_past=filter_past)
+    # Get races from CSV or Civic Engine API
+    if csv_path:
+        if verbose:
+            print(f"Loading races from CSV: {csv_path}")
+        races = load_races_from_csv(csv_path=csv_path, max_months_ahead=max_months_ahead, filter_past=filter_past)
+        if verbose:
+            print(f"Loaded {len(races)} unique races from CSV")
+    else:
+        # Get races from Civic Engine API (with date filtering)
+        races = get_civic_engine_races(max_months_ahead=max_months_ahead, filter_past=filter_past)
     
     if not races:
         print("No races found. Cannot generate recommendations.")
@@ -1752,8 +1923,10 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
         historical_comp = None
         historical_weight = 0.0
         try:
+            # Get election_name from race dict if available (for local races)
+            election_name = race.get('election_name', '')
             comp_score, comp_metadata = calculate_competitiveness_from_historical(
-                race_name, election_type, verbose=verbose
+                race_name, election_type, election_name=election_name, verbose=verbose
             )
             
             if comp_metadata.get('historical_elections_found', 0) > 0:
@@ -1775,12 +1948,15 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
         nanda_weight = 0.0
         if nanda_data:
             try:
+                # Get election_name from race dict if available (for local races)
+                election_name = race.get('election_name', '')
                 nanda_comp = calculate_competitiveness_nanda(
                     race_name, 
                     election_type, 
                     nanda_data, 
                     year=election_year,
                     race_level=race_level,
+                    election_name=election_name,
                     verbose=verbose
                 )
                 # NANDA weight is lower (less accurate than Kalshi/historical)
@@ -2055,12 +2231,34 @@ def process_races(max_races=None, verbose=True, nanda_year: Optional[int] = None
 if __name__ == "__main__":
     import sys
     # Allow limiting number of races via command line argument
+    # Usage: python find_scores.py [max_races] [csv_path]
+    #   or: python find_scores.py [csv_path] [max_races]
     max_races = None
-    if len(sys.argv) > 1:
-        try:
-            max_races = int(sys.argv[1])
-        except ValueError:
-            print(f"Invalid argument: {sys.argv[1]}. Expected a number.")
-            sys.exit(1)
+    csv_path = None
     
-    process_races(max_races=max_races, verbose=True)
+    if len(sys.argv) > 1:
+        # Check if first argument is a CSV file path
+        if sys.argv[1].endswith('.csv'):
+            csv_path = sys.argv[1]
+            # Check for max_races as second argument
+            if len(sys.argv) > 2:
+                try:
+                    max_races = int(sys.argv[2])
+                except ValueError:
+                    print(f"Invalid argument: {sys.argv[2]}. Expected a number.")
+                    sys.exit(1)
+        else:
+            # First argument is max_races
+            try:
+                max_races = int(sys.argv[1])
+            except ValueError:
+                print(f"Invalid argument: {sys.argv[1]}. Expected a number or CSV file path.")
+                sys.exit(1)
+            # Check for CSV path as second argument
+            if len(sys.argv) > 2 and sys.argv[2].endswith('.csv'):
+                csv_path = sys.argv[2]
+    
+    # If CSV is provided, default to filter_past=False to include all races
+    filter_past = False if csv_path else True
+    
+    process_races(max_races=max_races, verbose=True, csv_path=csv_path, filter_past=filter_past)
