@@ -1,7 +1,7 @@
 import os
 from openai import OpenAI
 import json
-from .extract_openai_response_text import extract_response_text
+from extract_openai_response_text import extract_response_text
 
 try:
     from credentials import RAYNA_OPENAI_API_KEY
@@ -81,6 +81,7 @@ for election_id, election_data in elections.items():
                         print ("Processed ", i, " candidates")
                         candidate_stances.to_csv("issue_alignment/candidate_stances1.csv", index=False)
                         candidate_data.to_csv("issue_alignment/candidate_data1.csv", index=False)
-
+                    if i > 2000:
+                        break
 candidate_stances.to_csv("issue_alignment/candidate_stances1.csv", index=False)
 candidate_data.to_csv("issue_alignment/candidate_data1.csv", index=False)
