@@ -20,18 +20,18 @@ function SearchResults({ results, userPolicies }) {
 
   return (
     <div className="search-results">
-      {results.map((election, index) => (
+      {results.map((race, index) => (
         <div key={index} className="election-card">
           <div className="election-header">
-            <h3 className="election-title">{election.name}</h3>
-            <span className="election-type">{election.type}</span>
+            <h3 className="election-title">{race.name}</h3>
+            <span className="election-type">{race.type}</span>
           </div>
-          <p className="election-date">{election.date}</p>
-          <p className="election-location">{election.location}</p>
+          <p className="election-date">{race.date}</p>
+          <p className="election-location">{race.location}</p>
           
           <div className="candidates-list">
             <h4 className="candidates-heading">Candidates</h4>
-            {election.candidates.map((candidate, candIndex) => (
+            {race.candidates.map((candidate, candIndex) => (
               <div key={candIndex} className="candidate-card">
                 <div className="candidate-header">
                   <div className="candidate-info">

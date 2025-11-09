@@ -20,7 +20,7 @@ The server will start on `http://localhost:5000`
 
 ### POST /run_search
 
-Runs a search to find matching elections and candidates based on user preferences.
+Runs a search to find matching races and candidates based on user preferences.
 
 **Request Body:**
 ```json
@@ -49,7 +49,7 @@ Runs a search to find matching elections and candidates based on user preference
   "success": true,
   "results": [
     {
-      "name": "2024 Presidential Election",
+      "name": "2024 Presidential Race",
       "type": "Federal",
       "date": "November 5, 2024",
       "location": "United States",

@@ -62,12 +62,12 @@ const formatFunding = (amount) => {
 }
 
 // Calculate win probability increase based on donation amount and candidate's current funding
-const calculateWinProbabilityIncrease = (donationAmount, candidateFunding, electionType) => {
+const calculateWinProbabilityIncrease = (donationAmount, candidateFunding, raceType) => {
   const donation = parseFloat(donationAmount) || 0
   if (donation <= 0) return 0
 
-  // Base impact multiplier varies by election type (local elections are more sensitive to donations)
-  const baseMultiplier = electionType === 'Local' ? 0.15 : electionType === 'State' ? 0.08 : 0.05
+  // Base impact multiplier varies by race type (local races are more sensitive to donations)
+  const baseMultiplier = raceType === 'Local' ? 0.15 : raceType === 'State' ? 0.08 : 0.05
   
   // Impact is inversely proportional to current funding (smaller campaigns benefit more)
   // Use logarithmic scaling to make it more realistic
@@ -77,17 +77,17 @@ const calculateWinProbabilityIncrease = (donationAmount, candidateFunding, elect
   // Calculate percentage increase (capped at reasonable maximums)
   const percentageIncrease = Math.min(
     (donation / Math.max(candidateFunding, donation)) * impactMultiplier * 100,
-    electionType === 'Local' ? 12 : electionType === 'State' ? 8 : 5
+    raceType === 'Local' ? 12 : raceType === 'State' ? 8 : 5
   )
   
   return Math.round(percentageIncrease * 10) / 10 // Round to 1 decimal place
 }
 
-// Dummy data generator
+// Dummy data generator (kept for fallback, but API should be used)
 const generateDummyResults = (donationAmount, userData) => {
-  const elections = [
+  const races = [
     {
-      name: '2024 Presidential Election',
+      name: '2024 Presidential Race',
       type: 'Federal',
       date: 'November 5, 2024',
       location: 'United States',
@@ -167,7 +167,7 @@ const generateDummyResults = (donationAmount, userData) => {
       ]
     },
     {
-      name: '2024 Mayoral Election',
+      name: '2024 Mayoral Race',
       type: 'Local',
       date: 'November 5, 2024',
       location: 'San Francisco, CA',
@@ -198,8 +198,8 @@ const generateDummyResults = (donationAmount, userData) => {
   ]
 
   // Add relevant viewpoints and win probability increase to each candidate
-  elections.forEach(election => {
-    election.candidates.forEach(candidate => {
+  races.forEach(race => {
+    race.candidates.forEach(candidate => {
       candidate.viewpoints = generateRelevantViewpoints(
         userData?.policies || [], 
         candidate.name
@@ -207,24 +207,24 @@ const generateDummyResults = (donationAmount, userData) => {
       candidate.winProbabilityIncrease = calculateWinProbabilityIncrease(
         donationAmount,
         candidate.funding,
-        election.type
+        race.type
       )
     })
   })
 
-  // Sort candidates within each election by alignment (highest first)
-  elections.forEach(election => {
-    election.candidates.sort((a, b) => b.alignment - a.alignment)
+  // Sort candidates within each race by alignment (highest first)
+  races.forEach(race => {
+    race.candidates.sort((a, b) => b.alignment - a.alignment)
   })
 
-  // Sort elections by highest candidate alignment
-  elections.sort((a, b) => {
+  // Sort races by highest candidate alignment
+  races.sort((a, b) => {
     const maxA = Math.max(...a.candidates.map(c => c.alignment))
     const maxB = Math.max(...b.candidates.map(c => c.alignment))
     return maxB - maxA
   })
 
-  return elections
+  return races
 }
 
 function App() {
@@ -305,12 +305,17 @@ function App() {
           </form>
         </div>
         
-        {searchResults ? (
+        {isSearching ? (
+          <div className="loading-container">
+            <div className="loading-spinner"></div>
+            <p className="loading-text">Searching for matching races...</p>
+          </div>
+        ) : searchResults ? (
           <SearchResults results={searchResults} userPolicies={userData?.policies || []} />
         ) : (
           <div className="content-placeholder">
             <h2>Search Results</h2>
-            <p>Enter your information and search to see matching elections and candidates.</p>
+            <p>Enter your information and search to see matching races and candidates.</p>
           </div>
         )}
       </main>
