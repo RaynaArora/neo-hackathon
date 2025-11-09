@@ -5,7 +5,7 @@ This module queries state and federal elections and retrieves candidates' stance
 """
 
 from typing import Dict, Any, Optional, List
-from datetime import date
+from datetime import date, timedelta
 from get_civicengine import query_civicengine
 
 
@@ -26,29 +26,30 @@ def _extract_nodes(payload: Any) -> List[Dict[str, Any]]:
 
 def get_elections_with_candidate_stances(
     token: Optional[str] = None,
-    max_elections: int = 100,
-    max_stances_per_candidate: int = 5,
+    max_elections: int = 10000,
     max_races_per_election: int = 200,
-    require_stances: bool = True
+    require_stances: bool = True,
+    levels: List[str] = ["STATE", "FEDERAL", "LOCAL", "CITY"]
 ) -> Dict[str, Any]:
     """
     Query upcoming state and federal elections, then fetch candidate stances per election.
     
     Args:
         token: Optional API token. If not provided, uses CIVIC_ENGINE_TOKEN from credentials
-        max_elections: Maximum number of elections to fetch (default: 100)
-        max_stances_per_candidate: Maximum number of stances to return per candidate (default: 5)
+        max_elections: Maximum number of elections to fetch (default: 10000)
         max_races_per_election: Maximum number of races to fetch per election (default: 200)
     
     Returns:
         Dictionary keyed by election ID containing races, candidates, and stances.
     """
-    today = date.today().isoformat()
+    today = (date.today() - timedelta(days=14)).isoformat()
+    #today = date.today().isoformat()
+    level_set = set(levels)
 
     elections_query = """
-    query GetStateFederalElections($today: ISO8601Date!, $first: Int!) {
+    query GetStateFederalElections($day: ISO8601Date!, $first: Int!) {
       elections(
-        filterBy: { electionDay: { gte: $today } }
+        filterBy: { electionDay: { eq: $day } }
         first: $first
       ) {
         nodes {
@@ -67,37 +68,39 @@ def get_elections_with_candidate_stances(
     }
     """
 
-    election_vars = {
-        "today": today,
-        "first": max_elections
-    }
 
-    election_response = query_civicengine(elections_query, variables=election_vars, token=token)
+    start_date = date.fromisoformat(today)
+    # today represents 14 days ago; iterate day-by-day up to actual today
+    end_date = date.today()
 
-    if "errors" in election_response:
-        raise RuntimeError(f"GraphQL errors: {election_response['errors']}")
+    elections_by_id: Dict[str, Dict[str, Any]] = {}
+    day = start_date
+    while day <= end_date:
+        election_vars = {
+            "day": day.isoformat(),
+            "first": max_elections
+        }
 
-    election_nodes = _extract_nodes(election_response.get("data", {}).get("elections"))
+        election_response = query_civicengine(elections_query, variables=election_vars, token=token)
 
-    # Filter to elections that have at least one state or federal race
-    eligible_elections = []
-    for election in election_nodes:
-        races_preview = _extract_nodes(election.get("races"))
-        has_state_federal = any(
-            (race.get("position") or {}).get("level") in ("STATE", "FEDERAL")
-            for race in races_preview
-        )
-        if has_state_federal:
-            eligible_elections.append({
+        if "errors" in election_response:
+            raise RuntimeError(f"GraphQL errors: {election_response['errors']}")
+
+        election_nodes = _extract_nodes(election_response.get("data", {}).get("elections"))
+        print ("Day: ", day.isoformat(), "Election nodes: ", len(election_nodes))
+        # add to elections_by_id
+        for election in election_nodes:
+            elections_by_id[election.get("id")] = {
                 "id": election.get("id"),
                 "name": election.get("name"),
                 "electionDay": election.get("electionDay")
-            })
+            }
+        day += timedelta(days=1)
 
     races_query = """
     query GetElectionRacesWithStances($electionId: ID!, $first: Int!) {
       races(
-        filterBy: { electionId: $electionId, level: [STATE, FEDERAL] }
+        filterBy: { electionId: $electionId, level: [STATE, FEDERAL, LOCAL, CITY] }
         first: $first
       ) {
         nodes {
@@ -135,18 +138,18 @@ def get_elections_with_candidate_stances(
 
     result: Dict[str, Any] = {}
 
-    for election in eligible_elections:
-        election_id = election["id"]
+    for election_id in elections_by_id:
         race_vars = {
             "electionId": election_id,
-            "first": max_races_per_election
+            "first": max_races_per_election,
+            #"levels": levels
         }
 
         race_response = query_civicengine(races_query, variables=race_vars, token=token)
 
         if "errors" in race_response:
             result[election_id] = {
-                **election,
+                **elections_by_id[election_id],
                 "races": [],
                 "race_count": 0,
                 "error": race_response["errors"]
@@ -156,7 +159,7 @@ def get_elections_with_candidate_stances(
         races_data = _extract_nodes(race_response.get("data", {}).get("races"))
 
         election_entry = {
-            **election,
+            **elections_by_id[election_id],
             "races": [],
             "race_count": 0
         }
@@ -164,7 +167,7 @@ def get_elections_with_candidate_stances(
         for race in races_data:
             position = race.get("position") or {}
             level = position.get("level")
-            if level not in ("STATE", "FEDERAL"):
+            if level not in set(levels):
                 continue
 
             candidacies = _extract_nodes(race.get("candidacies"))
@@ -175,7 +178,7 @@ def get_elections_with_candidate_stances(
 
                 stances = _extract_nodes(candidacy.get("stances"))
                 processed_stances = []
-                for stance in stances[:max_stances_per_candidate]:
+                for stance in stances:
                     issue = stance.get("issue", {})
                     processed_stances.append({
                         "id": stance.get("id"),
@@ -237,7 +240,7 @@ def get_elections_with_candidate_stances(
 if __name__ == "__main__":
     try:
         print("Fetching state and federal elections with candidate stances...")
-        elections = get_elections_with_candidate_stances(max_elections=50)
+        elections = get_elections_with_candidate_stances(max_elections=150)
         
         print(f"\nFound {len(elections)} state/federal elections with candidate stances:")
         print("=" * 80)
